@@ -163,7 +163,7 @@ class ChatSession(Base):
         UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
     )
     session_id: Mapped[str] = mapped_column(
-        String(100), unique=True, nullable=False, index=True
+        String(255), unique=True, nullable=False, index=True
     )
     messages: Mapped[dict] = mapped_column(JSON, default=list, nullable=False)
     created_at: Mapped[datetime] = mapped_column(

@@ -316,6 +316,8 @@ def build_deterministic_reply(intent: str, message: str, db_results: Any) -> Opt
         return GREETING_REPLY
 
     if intent in ["PRODUCT_SEARCH", "PRODUCT_RECOMMENDATION"]:
+        if isinstance(db_results, dict) and db_results.get("error"):
+            return db_results["error"]
         if isinstance(db_results, list):
             return _format_products(db_results, message)
         return _format_products([], message)
