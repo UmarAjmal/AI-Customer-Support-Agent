@@ -213,6 +213,36 @@ def _local_classify(message: str) -> tuple[str, float]:
 
 async def _hf_classify(message: str) -> str | None:
     prompt = INTENT_DETECTION_PROMPT.format(message=message)
+
+    # Try Groq API first (Llama 3)
+    if settings.GROQ_API_KEY:
+        url = "https://api.groq.com/openai/v1/chat/completions"
+        headers = {
+            "Authorization": f"Bearer {settings.GROQ_API_KEY}",
+            "Content-Type": "application/json",
+        }
+        payload = {
+            "model": settings.GROQ_MODEL,
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0.1,
+            "max_tokens": 15,
+        }
+        try:
+            async with httpx.AsyncClient(timeout=8.0) as client:
+                response = await client.post(url, json=payload, headers=headers)
+                if response.status_code == 200:
+                    res_data = response.json()
+                    text = res_data["choices"][0]["message"]["content"].strip().upper()
+                    logger.info("intent.groq_success", model=settings.GROQ_MODEL)
+                    for intent in VALID_INTENTS:
+                        if intent in text:
+                            return intent
+                else:
+                    logger.warning("intent.groq_failed", status_code=response.status_code)
+        except Exception as e:
+            logger.warning("intent.groq_exception", error=str(e))
+
+    # Fallback to Hugging Face
     payload = {
         "inputs": prompt,
         "parameters": {

@@ -38,6 +38,10 @@ class Settings(BaseSettings):
     HUGGINGFACE_API_KEY: str
     HF_MODEL_ID: str = "mistralai/Mistral-7B-Instruct-v0.2"
 
+    # ── Groq ──────────────────────────────────────────────────────────────────
+    GROQ_API_KEY: str = ""
+    GROQ_MODEL: str = "llama-3.1-8b-instant"
+
     # ── Storage ───────────────────────────────────────────────────────────────
     STORAGE_BUCKET: str = "shopease-uploads"
     MAX_FILE_SIZE_MB: int = 10

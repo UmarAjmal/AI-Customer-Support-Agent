@@ -360,7 +360,32 @@ def build_deterministic_reply(intent: str, message: str, db_results: Any) -> Opt
 
 
 async def call_llm(prompt: str) -> str:
-    """Optional LLM polish — used sparingly for complex shop replies."""
+    """Optional LLM polish — uses Groq API as primary (Llama 3), with HuggingFace fallback."""
+    if settings.GROQ_API_KEY:
+        url = "https://api.groq.com/openai/v1/chat/completions"
+        headers = {
+            "Authorization": f"Bearer {settings.GROQ_API_KEY}",
+            "Content-Type": "application/json",
+        }
+        payload = {
+            "model": settings.GROQ_MODEL,
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0.2,
+            "max_tokens": 600,
+        }
+        try:
+            async with httpx.AsyncClient(timeout=12.0) as client:
+                response = await client.post(url, json=payload, headers=headers)
+                if response.status_code == 200:
+                    res_data = response.json()
+                    res_text = res_data["choices"][0]["message"]["content"].strip()
+                    logger.info("groq_llm.success", model=settings.GROQ_MODEL)
+                    return res_text
+                logger.warning("groq_llm.api_error", status_code=response.status_code)
+        except Exception as e:
+            logger.warning("groq_llm.error", error=str(e))
+
+    # Fallback to Hugging Face
     url = f"https://api-inference.huggingface.co/models/{settings.HF_MODEL_ID}"
     headers = {"Authorization": f"Bearer {settings.HUGGINGFACE_API_KEY}"}
     payload = {
