@@ -70,8 +70,8 @@ def _extract_search_keywords(message: str) -> str:
             continue
         if len(w) >= 2:
             words.append(w)
-    # Prefer product-ish tokens; keep up to 6
-    return " ".join(words[:6])
+    # Prefer product-ish tokens; keep up to 10 to prevent truncating long comparison details
+    return " ".join(words[:10])
 
 
 def _is_price_question(message: str) -> bool:
