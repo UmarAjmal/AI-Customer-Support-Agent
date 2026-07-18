@@ -34,18 +34,35 @@ export const AgentProvider: React.FC<{ children: React.ReactNode }> = ({ childre
   const isStreamingRef = useRef(false);
   const messagesEndRef = useRef<HTMLDivElement | null>(null);
 
-  // Generate or restore session key
+  // Generate or restore session key — fetches a server-signed HMAC key
   const [sessionKey, setSessionKey] = useState<string>("");
 
   useEffect(() => {
-    if (typeof window !== "undefined") {
-      let key = localStorage.getItem("shopease-session-key");
-      if (!key) {
-        key = "session-" + Math.random().toString(36).substring(2, 15);
-        localStorage.setItem("shopease-session-key", key);
-      }
-      setSessionKey(key);
+    if (typeof window === "undefined") return;
+
+    const stored = localStorage.getItem("shopease-session-key");
+
+    // Re-use existing signed key if it's a server-signed format (contains 4 colons)
+    if (stored && stored.split(":").length >= 5) {
+      setSessionKey(stored);
+      return;
     }
+
+    // Fetch a new signed session key from the server
+    const API_BASE = process.env.NEXT_PUBLIC_API_URL || "https://ai-customer-support-agent-dchb.onrender.com";
+    fetch(`${API_BASE}/api/chat/session`)
+      .then((r) => r.json())
+      .then((data) => {
+        const key = data.session_key as string;
+        localStorage.setItem("shopease-session-key", key);
+        setSessionKey(key);
+      })
+      .catch(() => {
+        // Fallback: use random key if server unreachable (degraded mode)
+        const fallback = "ses:fallback:" + Math.random().toString(36).substring(2, 15) + ":0:unsigned";
+        localStorage.setItem("shopease-session-key", fallback);
+        setSessionKey(fallback);
+      });
   }, []);
 
   // Restore state from LocalStorage on mount
