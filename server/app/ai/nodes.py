@@ -417,7 +417,7 @@ async def call_llm(prompt: str) -> str:
             "model": settings.GROQ_MODEL,
             "messages": [{"role": "user", "content": prompt}],
             "temperature": 0.2,
-            "max_tokens": 600,
+            "max_tokens": 200,
         }
         try:
             async with httpx.AsyncClient(timeout=12.0) as client:
@@ -710,78 +710,116 @@ async def generate_response_node(state: AgentState) -> Dict[str, Any]:
     db_results = state.get("db_results")
     history = state.get("history", [])
 
-    # 1) Deterministic path — preferred (accurate + zero/low API cost)
+    # Determine fallback and suggestions
     deterministic = build_deterministic_reply(intent, message, db_results)
-    if deterministic and intent in [
-        "OFF_TOPIC",
-        "HUMAN_SUPPORT",
-        "GENERAL_CHAT",
-        "ORDER_TRACKING",
-        "RETURN_ITEM",
-        "FAQ",
-        "PRODUCT_SEARCH",
-        "PRODUCT_RECOMMENDATION",
-        "PRODUCT_REVIEW",
-    ]:
-        if intent == "GENERAL_CHAT":
-            # Call Groq to reply naturally to greetings/thanks/chat with shop context and memory
-            history_str = ""
-            for msg in history[-6:]:
-                history_str += f"{msg.get('role', 'user').capitalize()}: {msg.get('content', '')}\n"
-            prompt = f"""<s>[INST] {SYSTEM_PROMPT}
+    suggestions = _get_suggestions(intent, db_results)
 
-Recent Conversation:
-{history_str}
-User: {message}
+    # 1. API COST OPTIMIZATION: Early exit for OFF_TOPIC (refusal) and HUMAN_SUPPORT (complaint escalation)
+    # These represent simple, static template replies. Bypassing the LLM saves 100% of LLM token cost.
+    if intent == "OFF_TOPIC":
+        return {"response": OFF_TOPIC_REFUSAL, "suggestions": suggestions}
+    if intent == "HUMAN_SUPPORT":
+        return {"response": HUMAN_HANDOFF_REPLY, "suggestions": suggestions}
 
-Write a short, warm, and friendly response (under 45 words) in Roman Urdu or English acknowledging the user's greeting/chat.
-Remember context details (like their name or current topic) if shared in the conversation history. Keep it focused on ShopEase.
-STRICT RULE: Do not make up or hallucinate any custom coupon codes, sales events, or extra discount offers. [/INST]"""
-            llm = await call_llm(prompt)
-            if llm and len(llm) > 10:
-                suggestions = _get_suggestions(intent, db_results)
-                return {"response": llm, "suggestions": suggestions}
-            # Fallback to static
-            suggestions = _get_suggestions(intent, db_results)
-            return {"response": deterministic, "suggestions": suggestions}
-
-        # For products, optional light LLM polish only if user asked a complex compare/recommend question
-        complex_ask = any(
-            w in message.lower()
-            for w in ["compare", "difference", "vs", "versus", "which is better", "worth", "suggest", "best", "konsa"]
-        )
-        if intent in ["PRODUCT_SEARCH", "PRODUCT_RECOMMENDATION"] and complex_ask and isinstance(db_results, list) and db_results:
-            history_str = ""
-            for msg in history[-4:]:
-                history_str += f"{msg.get('role', 'user').capitalize()}: {msg.get('content', '')}\n"
-            prompt = f"""<s>[INST] {SYSTEM_PROMPT}
-
-[DATABASE RESULTS — use only these products]:
-{db_results}
-
-Recent Conversation:
-{history_str}
-User: {message}
-
-Write a short professional ShopEase reply comparing/recommending ONLY from the database results.
-STRICT RULE: Stick strictly to the prices and discount/scarcity details in the database. Never make up or hallucinate any custom coupons, discount codes, or sales offers. [/INST]"""
-            llm = await call_llm(prompt)
-            if llm and len(llm) > 40:
-                suggestions = _get_suggestions(intent, db_results)
-                return {"response": llm, "suggestions": suggestions}
-            
-            # If LLM failed/offline, use the structured offline comparison template
-            offline_comp = _format_offline_comparison(db_results)
-            if offline_comp:
-                suggestions = _get_suggestions(intent, db_results)
-                return {"response": offline_comp, "suggestions": suggestions}
-
-        # Generate contextual quick-reply suggestions
-        suggestions = _get_suggestions(intent, db_results)
+    # 2. API COST OPTIMIZATION: If user inputs exactly a raw code/tracking number (e.g. "SE-4392"),
+    # bypass the LLM and return the structured template directly.
+    is_raw_code = bool(re.match(r"^\s*(?:se|ord|ret)[- ]?\d{3,6}\s*$", message.strip(), re.I))
+    if is_raw_code and deterministic:
         return {"response": deterministic, "suggestions": suggestions}
 
-    # 2) Fallback safety
+    # 3. CONTEXT-AWARE RAG RETRIEVAL: Compile database search results into context
+    context_str = ""
+    if intent in ["PRODUCT_SEARCH", "PRODUCT_RECOMMENDATION"] and db_results:
+        # Limit to top 3 products to optimize input token counts & minimize API cost
+        context_str = "DATABASE PRODUCTS AVAILABLE:\n"
+        if isinstance(db_results, list):
+            for p in db_results[:3]:
+                orig = f" (Original Price: Rs. {int(p['original_price']):,})" if p.get("original_price") and p["original_price"] > p["price"] else ""
+                upsell = " [Alternative Recommendation]" if p.get("is_upsell") else ""
+                context_str += (
+                    f"- Name: {p['name']}{upsell}\n"
+                    f"  Brand: {p.get('brand') or 'N/A'}\n"
+                    f"  Category: {p.get('category') or 'N/A'}\n"
+                    f"  Price: Rs. {int(p['price']):,}{orig}\n"
+                    f"  Rating: ⭐ {p.get('rating', 0)} ({p.get('review_count', 0)} reviews)\n"
+                    f"  Stock left: {p.get('stock_quantity', 0)}\n"
+                    f"  Details: {p.get('description', '')}\n\n"
+                )
+    elif intent == "PRODUCT_REVIEW" and db_results:
+        context_str = "CUSTOMER REVIEWS FOR THE PRODUCT:\n"
+        if isinstance(db_results, list):
+            for r in db_results[:3]:
+                context_str += f"- Reviewer: {r.get('reviewer_name', 'Customer')} (Rating: ⭐{r.get('rating', 5)})\n  Review: {r.get('review_text', '')}\n"
+    elif intent == "ORDER_TRACKING" and db_results:
+        if isinstance(db_results, dict) and not db_results.get("error"):
+            context_str = (
+                f"ORDER DETAILS FOUND IN DATABASE:\n"
+                f"- Order Number: {db_results.get('order_number')}\n"
+                f"- Status: {db_results.get('status')}\n"
+                f"- Carrier: {db_results.get('carrier')}\n"
+                f"- Tracking Number: {db_results.get('tracking_number')}\n"
+                f"- Estimated Delivery: {db_results.get('estimated_delivery')}\n"
+                f"- Total Bill: Rs. {int(db_results.get('total_amount', 0)):,}\n"
+                f"- Payment Method: {db_results.get('payment_method')} ({db_results.get('payment_status')})\n"
+                f"- Items: {', '.join(db_results.get('items', []))}\n"
+            )
+        elif isinstance(db_results, dict) and db_results.get("error"):
+            context_str = f"ERROR/STATUS: {db_results.get('error')}\n"
+    elif intent == "RETURN_ITEM" and db_results:
+        if isinstance(db_results, dict) and not db_results.get("error"):
+            if db_results.get("success") is True:
+                context_str = (
+                    f"RETURN REQUEST CREATED SUCCESSFULLY:\n"
+                    f"- Return Ticket: {db_results.get('return_number')}\n"
+                    f"- Order Number: {db_results.get('order_number')}\n"
+                    f"- Refund Amount: Rs. {int(db_results.get('refund_amount', 0)):,}\n"
+                    f"- Status: Requested (Under Review)\n"
+                )
+            else:
+                context_str = (
+                    f"RETURN DETAILS IN DATABASE:\n"
+                    f"- Order Number: {db_results.get('order_number')}\n"
+                    f"- Return Ticket: {db_results.get('return_number')}\n"
+                    f"- Status: {db_results.get('status')}\n"
+                    f"- Refund Amount: Rs. {int(db_results.get('refund_amount', 0)):,}\n"
+                    f"- Reason: {db_results.get('reason')}\n"
+                )
+        elif isinstance(db_results, dict) and db_results.get("error"):
+            context_str = f"ERROR/STATUS: {db_results.get('error')}\n"
+    elif intent == "FAQ" and db_results:
+        context_str = "RELEVANT SHOP FAQ / POLICY FROM KNOWLEDGEBASE:\n"
+        if isinstance(db_results, list):
+            for f in db_results[:3]:
+                context_str += f"Q: {f['question']}\nA: {f['answer']}\n\n"
+
+    # 4. CONTEXT-AWARE LLM prompt construction
+    history_str = ""
+    for msg in history[-6:]:
+        history_str += f"{msg.get('role', 'user').capitalize()}: {msg.get('content', '')}\n"
+
+    prompt = f"""<s>[INST] {SYSTEM_PROMPT}
+
+[DATABASE / RAG CONTEXT]:
+{context_str or "No matching database data found for this query."}
+
+Recent Conversation History:
+{history_str}
+User Message: {message}
+
+Instructions:
+1. Act as ShopEase AI Customer Support. Provide a direct, natural response in Roman Urdu or English matching the user's language and tone.
+2. Address the user by their name (e.g. Umar bhai) if they introduced themselves in this turn or in the conversation history.
+3. Be conversational, warm, and professional. Avoid repeating "As-salamu alaykum" if you already greeted them in the history.
+4. Stick strictly to the facts in the DATABASE / RAG CONTEXT. Do not invent any pricing, order numbers, returns status, or coupon codes.
+5. Keep your response concise, direct, and under 50 words to be efficient. [/INST]"""
+
+    # 5. Call LLM for dynamic synthesis
+    llm_resp = await call_llm(prompt)
+    if llm_resp and len(llm_resp.strip()) > 5:
+        return {"response": llm_resp, "suggestions": suggestions}
+
+    # 6. Fallback safety
     return {
         "response": deterministic or GREETING_REPLY,
-        "suggestions": ["Browse products", "Track order", "FAQs"],
+        "suggestions": suggestions,
     }
