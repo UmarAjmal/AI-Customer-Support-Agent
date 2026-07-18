@@ -61,17 +61,48 @@ def _normalize_query_text(message: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
+URDU_ENGLISH_SYNONYMS = {
+    "garmi": "summer",
+    "garmiyon": "summer",
+    "sardi": "winter jacket",
+    "sardiyon": "winter jacket",
+    "sasta": "discount sale",
+    "sasti": "discount sale",
+    "saste": "discount sale",
+    "achha": "featured rating",
+    "achhi": "featured rating",
+    "achhe": "featured rating",
+    "kapde": "fashion shirt dress",
+    "kapra": "fashion shirt dress",
+    "kapray": "fashion shirt dress",
+    "joota": "shoes sneakers",
+    "jootay": "shoes sneakers",
+    "mobile": "mobiles phone",
+    "mobiles": "mobiles phone",
+    "earphone": "headphones",
+    "earbuds": "headphones",
+}
+
+
 def _extract_search_keywords(message: str) -> str:
-    """Keep brand tokens like hp/lg (len>=2) and drop filler words."""
+    """Keep brand tokens like hp/lg (len>=2), drop filler words, and expand synonyms for Hybrid RAG search."""
     text = _normalize_query_text(message)
     words = []
+    expanded = []
     for w in text.split():
         if w in STOPWORDS:
             continue
         if len(w) >= 2:
             words.append(w)
-    # Prefer product-ish tokens; keep up to 10 to prevent truncating long comparison details
-    return " ".join(words[:10])
+            if w in URDU_ENGLISH_SYNONYMS:
+                expanded.extend(URDU_ENGLISH_SYNONYMS[w].split())
+                
+    # Combine original keywords with expanded synonyms
+    all_tokens = words + expanded
+    seen = set()
+    unique_tokens = [x for x in all_tokens if not (x in seen or seen.add(x))]
+    
+    return " ".join(unique_tokens[:10])
 
 
 def _is_price_question(message: str) -> bool:
