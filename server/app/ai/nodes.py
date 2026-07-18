@@ -82,40 +82,87 @@ def _is_price_question(message: str) -> bool:
 def _format_products(products: List[Dict[str, Any]], message: str = "") -> str:
     if not products:
         return (
-            "I couldn't find matching products in our ShopEase catalog. "
-            "Try another name/brand (e.g. HP Pavilion, Sony headphones, Nike) or browse /products."
+            "As-salamu alaykum! I couldn't find matching products in our ShopEase catalog. "
+            "Try searching for another name or brand (e.g. HP Pavilion, Sony headphones, Nike) or browse our store /products. Shukriya!"
         )
 
     price_q = _is_price_question(message)
+    
+    # Neuromarketing hooks builder
+    def get_hooks(p: Dict[str, Any]) -> str:
+        hooks = []
+        stock = p.get("stock_quantity", 0)
+        rating = p.get("rating", 0)
+        orig_price = p.get("original_price")
+        price = p.get("price", 0)
+        
+        # Scarcity Hook
+        if 0 < stock <= 5:
+            hooks.append(f"⚠️ **Hurry! Only {stock} items left!**")
+        elif stock == 0:
+            hooks.append("❌ **Out of stock**")
+            
+        # Social Proof Hook
+        if rating >= 4.5:
+            hooks.append("⭐ **Highly rated by customers!**")
+            
+        # Value Anchoring / Discount Hook
+        if orig_price and orig_price > price:
+            savings = int(orig_price - price)
+            hooks.append(f"🔥 **Save Rs. {savings:,}! (Special Offer)**")
+            
+        return " · ".join(hooks) if hooks else ""
+
     if price_q and len(products) == 1:
         p = products[0]
         price = f"Rs. {int(p['price']):,}"
         orig = (
             f" (was Rs. {int(p['original_price']):,})"
-            if p.get("original_price")
+            if p.get("original_price") and p["original_price"] > p["price"]
             else ""
         )
         stock = p.get("stock_quantity", 0)
-        stock_txt = f"{stock} in stock" if stock > 0 else "Out of stock"
+        stock_txt = f"{stock} items left" if stock > 0 else "Out of stock"
+        hook_text = get_hooks(p)
+        hook_prefix = f"\n💡 {hook_text}" if hook_text else ""
+        
         return (
-            f"**{p['name']}** ki current price **{price}**{orig} hai.\n\n"
+            f"**{p['name']}** ki current price **{price}**{orig} hai.{hook_prefix}\n\n"
             f"• Brand: {p.get('brand') or '—'} · Category: {p.get('category')}\n"
             f"• Rating: ⭐ {p.get('rating', 0)} ({p.get('review_count', 0)} reviews)\n"
             f"• Stock: {stock_txt}\n\n"
             f"{(p.get('description') or '')[:160]}\n\n"
-            "Cart mein add karna hai ya kisi aur product ka price chahiye?"
+            "Apke liye isko cart me add karun ya kisi aur product ki specifications chahiye? Shukriya!"
         )
 
-    lines = ["Yeh products hamari live catalog se mile:\n"] if price_q else ["Here are matching items from our live catalog:\n"]
-    for p in products:
+    # Multi-product list (or comparisons/recommendations)
+    lines = ["Yeh products hamari live catalog se mile:\n"] if price_q else ["Here are the matching items from our catalog:\n"]
+    
+    # Distinguish upsells (category fallback match)
+    normal_products = [p for p in products if not p.get("is_upsell")]
+    upsell_products = [p for p in products if p.get("is_upsell")]
+
+    for p in normal_products:
         price = f"Rs. {int(p['price']):,}"
-        stock = p.get("stock_quantity", 0)
-        stock_txt = f"{stock} in stock" if stock > 0 else "Out of stock"
+        hook_text = get_hooks(p)
+        hook_suffix = f" — {hook_text}" if hook_text else ""
         lines.append(
             f"• **{p['name']}** ({p.get('brand') or p.get('category')})\n"
-            f"  **{price}** · ⭐ {p.get('rating', 0)} ({p.get('review_count', 0)} reviews) · {stock_txt}"
+            f"  Price: **{price}** · Rating: ⭐ {p.get('rating', 0)}{hook_suffix}"
         )
-    lines.append("\nKisi item ki zyada detail chahiye, ya cart mein add karun?")
+        
+    if upsell_products:
+        lines.append("\n🌟 **You might also like these relevant options:**")
+        for p in upsell_products:
+            price = f"Rs. {int(p['price']):,}"
+            hook_text = get_hooks(p)
+            hook_suffix = f" — {hook_text}" if hook_text else ""
+            lines.append(
+                f"• **{p['name']}** ({p.get('brand') or p.get('category')})\n"
+                f"  Price: **{price}** · Rating: ⭐ {p.get('rating', 0)}{hook_suffix}"
+            )
+
+    lines.append("\nKisi item ki zyada detail chahiye, ya cart mein add karun? Shukriya!")
     return "\n".join(lines)
 
 
@@ -144,44 +191,47 @@ def _format_order(order: Dict[str, Any]) -> str:
     city = order.get("shipping_city")
     city_txt = f" to **{city}**" if city else ""
     return (
-        f"I found order **#{order['order_number']}** in our system.\n\n"
-        f"• Status: **{str(order.get('status', '')).replace('_', ' ')}**\n"
-        f"• Courier: **{order.get('carrier')}**\n"
-        f"• Tracking: `{order.get('tracking_number')}`\n"
-        f"• Estimated delivery: **{order.get('estimated_delivery')}**{city_txt}\n"
-        f"• Total: **Rs. {int(order.get('total_amount', 0)):,}** "
-        f"({order.get('payment_status', 'n/a')} / {order.get('payment_method') or 'N/A'})\n"
+        f"As-salamu alaykum! I found order **#{order['order_number']}** in our database.\n\n"
+        f"• Status: **{str(order.get('status', '')).replace('_', ' ').title()}**\n"
+        f"• Courier Carrier: **{order.get('carrier')}**\n"
+        f"• Tracking ID: `{order.get('tracking_number')}`\n"
+        f"• Estimated Delivery: **{order.get('estimated_delivery')}**{city_txt}\n"
+        f"• Total Bill: **Rs. {int(order.get('total_amount', 0)):,}** "
+        f"({order.get('payment_status', 'n/a')} via {order.get('payment_method') or 'N/A'})\n"
         f"• Items: {items_txt}\n\n"
-        "Need a return check or anything else on this order?"
+        "Shukriya! Agar aapko is order ke return ya refund ki details chahiye to batayein."
     )
 
 
 def _format_return(data: Dict[str, Any]) -> str:
     if data.get("status") == "No return request submitted yet":
         return (
-            f"Order **#{data.get('order_number')}** currently has **no return request**. "
-            f"Order status: **{data.get('order_status')}**. "
-            f"{data.get('note', '')} "
-            "Share your order number if you'd like guidance on starting a return."
+            f"Order **#{data.get('order_number')}** has **no return request** submitted yet. "
+            f"Order Status is **{data.get('order_status')}**.\n\n"
+            f"💡 **Return Policy**: ShopEase provides a hassle-free 30-day return policy for all delivered products. "
+            f"Aap apna order return kar sakte hain. Share your order ID to initiate this return process. Shukriya!"
         )
     return (
-        f"Return update for order **#{data.get('order_number')}**:\n\n"
-        f"• Return ticket: `{data.get('return_number')}`\n"
-        f"• Status: **{data.get('status')}**\n"
-        f"• Refund amount: **Rs. {int(data.get('refund_amount') or 0):,}**\n"
-        f"• Reason: {data.get('reason') or '—'}\n"
+        f"As-salamu alaykum! Aapke order **#{data.get('order_number')}** ka return request status yeh hai:\n\n"
+        f"• Return Ticket: `{data.get('return_number')}`\n"
+        f"• Request Status: **{data.get('status').replace('_', ' ').title()}**\n"
+        f"• Refund Amount: **Rs. {int(data.get('refund_amount') or 0):,}**\n"
+        f"• Return Reason: {data.get('reason') or '—'}\n\n"
+        f"💡 **Refund Info**: Refund completes within 7-10 working days, direct to EasyPaisa, JazzCash, or bank account. Shukriya!"
     )
 
 
 def _format_faqs(faqs: List[Dict[str, Any]]) -> str:
     if not faqs:
         return (
-            "I can help with shipping (free 3–5 days), payments (COD / EasyPaisa / JazzCash / cards), "
-            "30-day returns, warranty, and contact details. Which topic do you need?"
+            "As-salamu alaykum! ShopEase Policy ke mutabiq hum 3-5 days delivery (free on orders), "
+            "Cash on Delivery (COD), EasyPaisa, JazzCash payments, 30-day hassle-free returns, aur 1-year product warranty provide karte hain. "
+            "Aapko kis policy ki detail chahiye? Shukriya!"
         )
-    parts = ["Here's what our ShopEase policy says:\n"]
+    parts = ["As-salamu alaykum! Here is the relevant policy information from ShopEase:\n"]
     for f in faqs[:3]:
         parts.append(f"**{f['question']}**\n{f['answer']}\n")
+    parts.append("Agar mazeed details chahiye to kindly batayein. Shukriya!")
     return "\n".join(parts)
 
 
@@ -278,32 +328,82 @@ async def query_db_node(state: AgentState, db: AsyncSession) -> Dict[str, Any]:
 
     try:
         if intent in ["PRODUCT_SEARCH", "PRODUCT_RECOMMENDATION"]:
-            keywords = _extract_search_keywords(message)
-            db_results = await db_search_products(db, keywords)
+            lower_msg = message.lower()
+            if any(w in lower_msg for w in ["sale", "discount", "offer", "deal", "sasta", "discounts", "sales"]):
+                # Query products on sale (original_price > price)
+                from sqlalchemy import select
+                from app.database import models
+                from app.ai.tools import _product_dict
+                stmt = select(models.Product).where(
+                    models.Product.original_price > models.Product.price,
+                    models.Product.is_active.is_(True)
+                ).order_by(models.Product.rating.desc()).limit(5)
+                res = await db.execute(stmt)
+                db_results = [_product_dict(p) for p in res.scalars().all()]
+            elif any(w in lower_msg for w in ["new arrival", "naya", "nayay", "latest", "new arrivals", "arrivals"]):
+                # Query newest products
+                from sqlalchemy import select
+                from app.database import models
+                from app.ai.tools import _product_dict
+                stmt = select(models.Product).where(
+                    models.Product.is_active.is_(True)
+                ).order_by(models.Product.created_at.desc()).limit(5)
+                res = await db.execute(stmt)
+                db_results = [_product_dict(p) for p in res.scalars().all()]
+            else:
+                keywords = _extract_search_keywords(message)
+                db_results = await db_search_products(db, keywords)
+
+            # Category Upselling Fallback (if exactly 1 product matched)
+            if isinstance(db_results, list) and len(db_results) == 1:
+                try:
+                    product = db_results[0]
+                    category = product.get("category")
+                    product_id = product.get("id")
+                    if category and product_id:
+                        from sqlalchemy import select
+                        from app.database import models
+                        from app.ai.tools import _product_dict
+                        from uuid import UUID
+                        
+                        stmt = select(models.Product).where(
+                            models.Product.category == category,
+                            models.Product.id != UUID(product_id),
+                            models.Product.is_active.is_(True)
+                        ).order_by(models.Product.rating.desc()).limit(2)
+                        
+                        alt_res = await db.execute(stmt)
+                        alts = alt_res.scalars().all()
+                        for alt in alts:
+                            alt_dict = _product_dict(alt)
+                            alt_dict["is_upsell"] = True
+                            db_results.append(alt_dict)
+                except Exception as upsell_err:
+                    logger.warning("query_db_node.upsell_failed", error=str(upsell_err))
 
         elif intent in ["ORDER_TRACKING", "RETURN_ITEM"]:
             order_ref = _extract_order_ref(message)
             if not order_ref:
                 db_results = {
                     "error": (
-                        "Please share your order number so I can look it up "
-                        "(e.g. **SE-9821** or **ORD-1023**)."
+                        "As-salamu alaykum! Kindly check aur apna correct order number share karein "
+                        "(e.g. **SE-9821** ya **ORD-1023**) taake hum search kar sakein. Shukriya!"
                     )
                 }
             elif intent == "ORDER_TRACKING":
                 found = await db_track_order(db, order_ref)
                 db_results = found or {
                     "error": (
-                        f"I couldn't find order **{order_ref}** in our system. "
-                        "Double-check the number or try another (e.g. SE-9821)."
+                        f"As-salamu alaykum! Mujhe system me order **{order_ref}** nahi mila. "
+                        "Kindly double-check karke correct order ID enter karein. Shukriya!"
                     )
                 }
             else:
                 found = await db_check_return_status(db, order_ref)
                 db_results = found or {
                     "error": (
-                        f"No return record found for **{order_ref}**. "
-                        "If this was a delivered order, I can guide you on starting a return."
+                        f"Order **{order_ref}** ke liye return details nahi mili. "
+                        "Agar aapka order deliver ho chuka hai, to aap returns initiate kar sakte hain. Shukriya!"
                     )
                 }
 
@@ -323,8 +423,8 @@ async def query_db_node(state: AgentState, db: AsyncSession) -> Dict[str, Any]:
         logger.error("query_db_node.db_error", error=str(e))
         db_results = {
             "error": (
-                "I'm having trouble reaching our store database right now. "
-                "Please try again in a moment, or email support@shopease.pk."
+                "As-salamu alaykum! I'm having trouble reaching our database right now. "
+                "Kindly try again in a moment, or contact support@shopease.pk. Shukriya!"
             )
         }
 

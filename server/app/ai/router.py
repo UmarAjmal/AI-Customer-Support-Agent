@@ -105,6 +105,16 @@ def _local_classify(message: str) -> tuple[str, float]:
     if not text:
         return "GENERAL_CHAT", 0.9
 
+    # Instant jailbreak / prompt injection block
+    jailbreak_terms = [
+        "ignore instructions", "ignore rules", "ignore previous", "you are now",
+        "system prompt", "dan mode", "jailbreak", "developer mode", "override",
+        "print your rules", "reveal your instructions", "forget your support domain",
+        "write a python", "write python", "write a script", "programming code",
+    ]
+    if any(term in text for term in jailbreak_terms):
+        return "OFF_TOPIC", 1.0
+
     has_order_ref = bool(re.search(r"\b(?:se|ord|ret)[- ]?\d{3,6}\b", text, re.I))
 
     if any(k in text for k in OFF_TOPIC_KEYWORDS):
