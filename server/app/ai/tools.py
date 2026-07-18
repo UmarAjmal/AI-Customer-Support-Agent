@@ -41,11 +41,99 @@ def _product_dict(p: models.Product) -> Dict[str, Any]:
     }
 
 
+import math
+from collections import Counter
+
+class SimpleTFIDF:
+    def __init__(self, products_list: List[Dict[str, Any]]):
+        self.products = products_list
+        self.doc_tokens = []
+        self.vocab = set()
+        self.num_docs = len(products_list)
+        
+        # Tokenize and build vocabulary
+        for p in products_list:
+            text = f"{p.get('name', '')} {p.get('brand', '') or ''} {p.get('category', '') or ''} {p.get('description', '') or ''}".lower()
+            tokens = [t for t in re.split(r"\W+", text) if len(t) >= 2]
+            self.doc_tokens.append(tokens)
+            self.vocab.update(tokens)
+            
+        self.vocab = sorted(list(self.vocab))
+        self.vocab_index = {w: i for i, w in enumerate(self.vocab)}
+        
+        # Compute IDF
+        self.idf = {}
+        for token in self.vocab:
+            df = sum(1 for tokens in self.doc_tokens if token in tokens)
+            self.idf[token] = math.log((1 + self.num_docs) / (1 + df)) + 1.0
+            
+        # Vectorize all products
+        self.doc_vectors = []
+        for tokens in self.doc_tokens:
+            self.doc_vectors.append(self._vectorize(tokens))
+
+    def _vectorize(self, tokens: List[str]) -> Dict[int, float]:
+        counts = Counter(tokens)
+        vec = {}
+        total_words = len(tokens) if tokens else 1
+        for token, count in counts.items():
+            if token in self.vocab_index:
+                tf = count / total_words
+                vec[self.vocab_index[token]] = tf * self.idf[token]
+        return vec
+
+    def search(self, query: str, top_n: int = 5) -> List[tuple[Dict[str, Any], float]]:
+        query_tokens = [t for t in re.split(r"\W+", query.lower()) if len(t) >= 2]
+        if not query_tokens:
+            return []
+            
+        query_vec = self._vectorize(query_tokens)
+        q_sum_sq = sum(val ** 2 for val in query_vec.values())
+        if q_sum_sq == 0.0:
+            return []
+        q_norm = math.sqrt(q_sum_sq)
+        
+        scored_products = []
+        for idx, doc_vec in enumerate(self.doc_vectors):
+            dot = 0.0
+            for term_idx, q_val in query_vec.items():
+                if term_idx in doc_vec:
+                    dot += q_val * doc_vec[term_idx]
+                    
+            d_sum_sq = sum(val ** 2 for val in doc_vec.values())
+            d_norm = math.sqrt(d_sum_sq) if d_sum_sq > 0 else 0.0
+            
+            sim = (dot / (q_norm * d_norm)) if (q_norm > 0 and d_norm > 0) else 0.0
+            if sim > 0.02:
+                scored_products.append((self.products[idx], sim))
+                
+        scored_products.sort(key=lambda x: x[1], reverse=True)
+        return scored_products[:top_n]
+
+
+_tfidf_index: Optional[SimpleTFIDF] = None
+
+async def _init_tfidf(db: AsyncSession):
+    global _tfidf_index
+    if _tfidf_index is not None:
+        return
+    try:
+        stmt = select(models.Product).where(models.Product.is_active.is_(True))
+        result = await db.execute(stmt)
+        products_db = result.scalars().all()
+        products_list = [_product_dict(p) for p in products_db]
+        if products_list:
+            _tfidf_index = SimpleTFIDF(products_list)
+    except Exception as e:
+        # Graceful fallback if query fails
+        _tfidf_index = None
+
+
 async def db_search_products(db: AsyncSession, query: str) -> List[Dict[str, Any]]:
     """
-    Search active products with token OR matching + light typo tolerance.
-    Example: "HP Pvilion 15 price" → tokens hp, pavilion, 15
+    Search active products using a Hybrid RAG search (Lexical SQL + Cosine Similarity TF-IDF vector).
     """
+    await _init_tfidf(db)
     base = and_(models.Product.is_active.is_(True))
 
     q = (query or "").strip()
@@ -76,7 +164,7 @@ async def db_search_products(db: AsyncSession, query: str) -> List[Dict[str, Any
     if not tokens:
         tokens = [q_norm]
 
-    # OR across tokens (any token match in name/brand/category/description)
+    # 1. Lexical SQL Match
     clauses = []
     for t in tokens:
         like = f"%{t}%"
@@ -91,51 +179,49 @@ async def db_search_products(db: AsyncSession, query: str) -> List[Dict[str, Any
 
     stmt = select(models.Product).where(base, or_(*clauses)).limit(25)
     result = await db.execute(stmt)
-    products = list(result.scalars().all())
+    lexical_db = list(result.scalars().all())
+    lexical_matches = [_product_dict(p) for p in lexical_db]
 
-    # Rank: prefer products matching more tokens in name/brand
-    def score(p: models.Product) -> int:
-        name = (p.name or "").lower()
-        brand = (p.brand or "").lower()
-        cat = (p.category or "").lower()
-        blob = f"{name} {brand} {cat}"
-        s = 0
-        for t in tokens:
-            if t in name:
-                s += 4
-            elif t in brand:
-                s += 4
-            elif t in blob:
-                s += 1
-        if q_norm in name:
-            s += 6
-        # Prefer fuller name overlap
-        overlap = sum(1 for t in tokens if t in name)
-        s += overlap * 2
-        return s
+    # 2. Vector Cosine Similarity Match
+    vector_matches = []
+    if _tfidf_index:
+        vector_matches = _tfidf_index.search(q_norm, top_n=10)
 
-    products.sort(key=score, reverse=True)
-    ranked = [p for p in products if score(p) > 0] or products
+    # 3. Hybrid Fusion scoring
+    merged_map = {}
+    for doc, sim in vector_matches:
+        merged_map[doc["id"]] = {"doc": doc, "vector_score": sim, "lexical_score": 0.0}
 
-    # If query includes a known brand, keep products matching that brand first
-    brand_tokens = {
-        "hp", "dell", "apple", "samsung", "sony", "nike", "adidas", "puma",
-        "xiaomi", "google", "anker", "logitech", "iphone", "macbook",
-    }
-    brands_in_q = [t for t in tokens if t in brand_tokens]
-    if brands_in_q:
-        def brand_ok(p: models.Product) -> bool:
-            blob = f"{p.name} {p.brand or ''}".lower()
-            return any(b in blob for b in brands_in_q)
+    for doc in lexical_matches:
+        lex_score = 1.0
+        if doc["id"] in merged_map:
+            merged_map[doc["id"]]["lexical_score"] = lex_score
+        else:
+            merged_map[doc["id"]] = {"doc": doc, "vector_score": 0.0, "lexical_score": lex_score}
 
-        branded = [p for p in ranked if brand_ok(p)]
-        ranked = branded  # If empty, return empty list instead of falling back to other brands
+    hybrid_ranked = []
+    for item in merged_map.values():
+        doc = item["doc"]
+        v_score = item["vector_score"]
+        l_score = item["lexical_score"]
 
-    # For tight brand+model queries, prefer top match only when clearly ahead
-    if len(ranked) > 1 and score(ranked[0]) >= score(ranked[1]) + 3:
-        ranked = ranked[:1]
+        # Boost brand and exact name overlaps
+        brand_boost = 0.0
+        name_lower = doc["name"].lower()
+        brand_lower = (doc.get("brand") or "").lower()
+        for token in tokens:
+            if token in name_lower:
+                brand_boost += 0.2
+            if brand_lower and token in brand_lower:
+                brand_boost += 0.3
 
-    return [_product_dict(p) for p in ranked[:5]]
+        hybrid_score = (v_score * 0.6) + (l_score * 0.4) + brand_boost
+        hybrid_ranked.append((doc, hybrid_score))
+
+    hybrid_ranked.sort(key=lambda x: x[1], reverse=True)
+    ranked = [x[0] for x in hybrid_ranked if x[1] > 0.02] or [x[0] for x in hybrid_ranked]
+
+    return ranked[:5]
 
 
 async def db_track_order(db: AsyncSession, query_str: str) -> Optional[Dict[str, Any]]:

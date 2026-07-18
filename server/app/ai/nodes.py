@@ -704,6 +704,62 @@ def _format_offline_comparison(products: List[Dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
+def _extract_user_name(history: List[Dict[str, Any]], current_msg: str) -> str:
+    combined = [current_msg] + [m.get("content", "") for m in reversed(history) if m.get("role") == "user"]
+    for text in combined:
+        lower = text.lower()
+        m1 = re.search(r"\bmera\s+na+m\s+([a-z0-9 ]+?)(?:\s+ha|hai|ba?ta|$)|\bmera\s+na+m\s+([a-z0-9 ]+)", lower)
+        if m1:
+            val = m1.group(1) or m1.group(2)
+            if val:
+                return val.strip().title()
+        m2 = re.search(r"\bmy\s+name\s+is\s+([a-z0-9 ]+?)(?:$|\.)", lower)
+        if m2:
+            return m2.group(1).strip().title()
+        m3 = re.search(r"\bi\s+am\s+([a-z0-9 ]+?)(?:$|\.)", lower)
+        if m3:
+            return m3.group(1).strip().title()
+    return "Valued Customer"
+
+
+def get_mock_user_profile(name: str) -> Dict[str, Any]:
+    # Match mock customer profile associated with the name
+    clean_name = name if name != "Valued Customer" else "Umar"
+    return {
+        "full_name": clean_name,
+        "email": f"{clean_name.lower().replace(' ', '')}@example.com",
+        "phone": "+92 300 1234567",
+        "city": "Karachi",
+        "recent_purchases": [
+            {
+                "order_number": "SE-4392",
+                "items": ["Samsung Galaxy S24 x1"],
+                "total_amount": 85000,
+                "status": "delivered",
+                "date": "2026-07-12",
+            }
+        ],
+        "active_cart": ["Cotton Casual Shirt x1"],
+        "preferred_categories": ["Electronics", "Fashion"],
+    }
+
+
+def _detect_sentiment(current_msg: str, history: List[Dict[str, Any]]) -> str:
+    text = current_msg.lower()
+    for m in history[-4:]:
+        if m.get("role") == "user":
+            text += " " + m.get("content", "").lower()
+            
+    negative_words = [
+        "angry", "disappointed", "worst", "bad ", "slow", "late", "scam", "cheat",
+        "ghalat", "bekar", "bakwas", "kharab", "waste", "useless", "annoyed", "frustrated",
+        "disappoint", "shoking", "rubbish", "poor", "frazool", "fazool", "sad"
+    ]
+    if any(w in text for w in negative_words):
+        return "FRUSTRATED"
+    return "NORMAL"
+
+
 async def generate_response_node(state: AgentState) -> Dict[str, Any]:
     intent = state.get("intent", "GENERAL_CHAT")
     message = state["message"]
@@ -715,7 +771,6 @@ async def generate_response_node(state: AgentState) -> Dict[str, Any]:
     suggestions = _get_suggestions(intent, db_results)
 
     # 1. API COST OPTIMIZATION: Early exit for OFF_TOPIC (refusal) and HUMAN_SUPPORT (complaint escalation)
-    # These represent simple, static template replies. Bypassing the LLM saves 100% of LLM token cost.
     if intent == "OFF_TOPIC":
         return {"response": OFF_TOPIC_REFUSAL, "suggestions": suggestions}
     if intent == "HUMAN_SUPPORT":
@@ -727,11 +782,35 @@ async def generate_response_node(state: AgentState) -> Dict[str, Any]:
     if is_raw_code and deterministic:
         return {"response": deterministic, "suggestions": suggestions}
 
-    # 3. CONTEXT-AWARE RAG RETRIEVAL: Compile database search results into context
+    # 3. EXTRACT CUSTOMER PROFILE CONTEXT & SENTIMENT
+    user_name = _extract_user_name(history, message)
+    profile = get_mock_user_profile(user_name)
+    sentiment = _detect_sentiment(message, history)
+
+    # Adapt suggestions for frustrated customers to prioritize help over promotions
+    if sentiment == "FRUSTRATED":
+        suggestions = ["Contact support", "Check return policy", "Track my order"]
+
+    # 4. CONTEXT-AWARE RAG RETRIEVAL: Compile database search results into context
     context_str = ""
+    
+    # Inject personalized Customer Profile
+    context_str += (
+        f"LOGGED-IN CUSTOMER PROFILE:\n"
+        f"- Name: {profile['full_name']}\n"
+        f"- Email: {profile['email']}\n"
+        f"- Location: {profile['city']}\n"
+        f"- Active Cart: {', '.join(profile['active_cart'])}\n"
+        f"- Preferred Categories: {', '.join(profile['preferred_categories'])}\n"
+        f"- Purchase History:\n"
+    )
+    for p in profile["recent_purchases"]:
+        context_str += f"  * Order {p['order_number']}: {', '.join(p['items'])} (Status: {p['status']}, Date: {p['date']}, Amount: Rs. {p['total_amount']:,})\n"
+    context_str += "\n"
+
     if intent in ["PRODUCT_SEARCH", "PRODUCT_RECOMMENDATION"] and db_results:
         # Limit to top 3 products to optimize input token counts & minimize API cost
-        context_str = "DATABASE PRODUCTS AVAILABLE:\n"
+        context_str += "DATABASE PRODUCTS AVAILABLE:\n"
         if isinstance(db_results, list):
             for p in db_results[:3]:
                 orig = f" (Original Price: Rs. {int(p['original_price']):,})" if p.get("original_price") and p["original_price"] > p["price"] else ""
@@ -746,13 +825,13 @@ async def generate_response_node(state: AgentState) -> Dict[str, Any]:
                     f"  Details: {p.get('description', '')}\n\n"
                 )
     elif intent == "PRODUCT_REVIEW" and db_results:
-        context_str = "CUSTOMER REVIEWS FOR THE PRODUCT:\n"
+        context_str += "CUSTOMER REVIEWS FOR THE PRODUCT:\n"
         if isinstance(db_results, list):
             for r in db_results[:3]:
                 context_str += f"- Reviewer: {r.get('reviewer_name', 'Customer')} (Rating: ⭐{r.get('rating', 5)})\n  Review: {r.get('review_text', '')}\n"
     elif intent == "ORDER_TRACKING" and db_results:
         if isinstance(db_results, dict) and not db_results.get("error"):
-            context_str = (
+            context_str += (
                 f"ORDER DETAILS FOUND IN DATABASE:\n"
                 f"- Order Number: {db_results.get('order_number')}\n"
                 f"- Status: {db_results.get('status')}\n"
@@ -764,11 +843,11 @@ async def generate_response_node(state: AgentState) -> Dict[str, Any]:
                 f"- Items: {', '.join(db_results.get('items', []))}\n"
             )
         elif isinstance(db_results, dict) and db_results.get("error"):
-            context_str = f"ERROR/STATUS: {db_results.get('error')}\n"
+            context_str += f"ERROR/STATUS: {db_results.get('error')}\n"
     elif intent == "RETURN_ITEM" and db_results:
         if isinstance(db_results, dict) and not db_results.get("error"):
             if db_results.get("success") is True:
-                context_str = (
+                context_str += (
                     f"RETURN REQUEST CREATED SUCCESSFULLY:\n"
                     f"- Return Ticket: {db_results.get('return_number')}\n"
                     f"- Order Number: {db_results.get('order_number')}\n"
@@ -776,7 +855,7 @@ async def generate_response_node(state: AgentState) -> Dict[str, Any]:
                     f"- Status: Requested (Under Review)\n"
                 )
             else:
-                context_str = (
+                context_str += (
                     f"RETURN DETAILS IN DATABASE:\n"
                     f"- Order Number: {db_results.get('order_number')}\n"
                     f"- Return Ticket: {db_results.get('return_number')}\n"
@@ -785,22 +864,37 @@ async def generate_response_node(state: AgentState) -> Dict[str, Any]:
                     f"- Reason: {db_results.get('reason')}\n"
                 )
         elif isinstance(db_results, dict) and db_results.get("error"):
-            context_str = f"ERROR/STATUS: {db_results.get('error')}\n"
+            context_str += f"ERROR/STATUS: {db_results.get('error')}\n"
     elif intent == "FAQ" and db_results:
-        context_str = "RELEVANT SHOP FAQ / POLICY FROM KNOWLEDGEBASE:\n"
+        context_str += "RELEVANT SHOP FAQ / POLICY FROM KNOWLEDGEBASE:\n"
         if isinstance(db_results, list):
             for f in db_results[:3]:
                 context_str += f"Q: {f['question']}\nA: {f['answer']}\n\n"
 
-    # 4. CONTEXT-AWARE LLM prompt construction
+    # 5. CONTEXT-AWARE LLM prompt construction
     history_str = ""
     for msg in history[-6:]:
         history_str += f"{msg.get('role', 'user').capitalize()}: {msg.get('content', '')}\n"
 
+    # Define sentiment adaptive instructions
+    sentiment_instructions = ""
+    if sentiment == "FRUSTRATED":
+        sentiment_instructions = (
+            "\n[CRITICAL PERSONA DIRECTION - USER IS FRUSTRATED/DISAPPOINTED]:\n"
+            "The customer appears frustrated or disappointed. Adjust your tone to be highly empathetic, sincere, and apologetic. "
+            "Prioritize helping them immediately. Do NOT offer any sales promotions, product recommendations, or up-selling. "
+            "Focus strictly on resolving their issues (returns, tracking, refunds) with absolute politeness."
+        )
+    else:
+        sentiment_instructions = (
+            "Be helpful and friendly. If appropriate and they ask for suggestions, you can refer to their LOGGED-IN CUSTOMER PROFILE "
+            "active cart or preferred categories to make personalized cross-selling remarks."
+        )
+
     prompt = f"""<s>[INST] {SYSTEM_PROMPT}
 
 [DATABASE / RAG CONTEXT]:
-{context_str or "No matching database data found for this query."}
+{context_str}
 
 Recent Conversation History:
 {history_str}
@@ -808,17 +902,17 @@ User Message: {message}
 
 Instructions:
 1. Act as ShopEase AI Customer Support. Provide a direct, natural response in Roman Urdu or English matching the user's language and tone.
-2. Address the user by their name (e.g. Umar bhai) if they introduced themselves in this turn or in the conversation history.
+2. Address the user by their name (e.g. Umar bhai) as defined in the LOGGED-IN CUSTOMER PROFILE name.
 3. Be conversational, warm, and professional. Avoid repeating "As-salamu alaykum" if you already greeted them in the history.
 4. Stick strictly to the facts in the DATABASE / RAG CONTEXT. Do not invent any pricing, order numbers, returns status, or coupon codes.
-5. Keep your response concise, direct, and under 50 words to be efficient. [/INST]"""
+5. Keep your response concise, direct, and under 50 words to be efficient. {sentiment_instructions} [/INST]"""
 
-    # 5. Call LLM for dynamic synthesis
+    # 6. Call LLM for dynamic synthesis
     llm_resp = await call_llm(prompt)
     if llm_resp and len(llm_resp.strip()) > 5:
         return {"response": llm_resp, "suggestions": suggestions}
 
-    # 6. Fallback safety
+    # 7. Fallback safety
     return {
         "response": deterministic or GREETING_REPLY,
         "suggestions": suggestions,
