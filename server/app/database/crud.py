@@ -153,6 +153,35 @@ async def delete_product(db: AsyncSession, product: models.Product) -> None:
     await db.commit()
 
 
+# ─── Product Reviews CRUD ─────────────────────────────────────────────────────
+async def create_product_review(
+    db: AsyncSession, product_id: UUID, review_in: schemas.ProductReviewCreate
+) -> models.ProductReview:
+    review = models.ProductReview(
+        product_id=product_id,
+        reviewer_name=review_in.reviewer_name,
+        rating=review_in.rating,
+        review_text=review_in.review_text,
+    )
+    db.add(review)
+    await db.commit()
+    await db.refresh(review)
+    return review
+
+
+async def get_product_reviews(
+    db: AsyncSession, product_id: UUID, limit: int = 5
+) -> list[models.ProductReview]:
+    stmt = (
+        select(models.ProductReview)
+        .where(models.ProductReview.product_id == product_id)
+        .order_by(models.ProductReview.created_at.desc())
+        .limit(limit)
+    )
+    result = await db.execute(stmt)
+    return list(result.scalars().all())
+
+
 # ─── Order CRUD ───────────────────────────────────────────────────────────────
 async def create_order(db: AsyncSession, order_in: schemas.OrderCreate) -> models.Order:
     # 1. Deduct stock quantities for items

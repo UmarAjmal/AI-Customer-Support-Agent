@@ -16,6 +16,7 @@ HEADERS = {"Authorization": f"Bearer {settings.HUGGINGFACE_API_KEY}"}
 VALID_INTENTS = [
     "PRODUCT_SEARCH",
     "PRODUCT_RECOMMENDATION",
+    "PRODUCT_REVIEW",
     "ORDER_TRACKING",
     "RETURN_ITEM",
     "FAQ",
@@ -42,6 +43,8 @@ PRODUCT_SIGNALS = [
     "dikhao", "dikhain", "dikhayein", "chahiye", "chahye", "dhoondo", "dhandho",
     "khareedna", "kharidna", "kharid", "buy karna", "lena ha", "lena hai",
     "milega", "mileyga", "milga", "rate kya", "price kya",
+    # New arrivals Roman Urdu
+    "naye", "nayi", "naya", "nayay",
 ]
 
 URDU_PRICE_PATTERNS = [
@@ -186,6 +189,13 @@ def _local_classify(message: str) -> tuple[str, float]:
         for k in ["recommend", "suggest", "gift", "best for", "what should i", "konsa best", "kaunsa best"]
     ):
         return "PRODUCT_RECOMMENDATION", 0.9
+
+    # Review detection — before generic product search
+    if any(k in text for k in [
+        "review", "reviews", "customer review", "log kya kehte", "ratings", "feedback",
+        "kya review", "review kya",
+    ]):
+        return "PRODUCT_SEARCH", 0.92  # node will re-route to PRODUCT_REVIEW
 
     # Product search — MUST catch price/brand/Urdu asks (this was the bug)
     if _has_product_signal(text):

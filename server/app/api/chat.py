@@ -1,11 +1,12 @@
 """
 app/api/chat.py — Streaming chat endpoint using Server Sent Events (SSE).
 Streams generated response tokens sequentially for high responsiveness.
+Includes typing indicator and contextual quick-reply suggestions.
 """
 import asyncio
 import json
 from typing import AsyncGenerator
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends
 from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -23,40 +24,47 @@ async def chat_stream(
 ):
     """
     Handle customer message and yield a stream of tokens using Server Sent Events.
-    Uses SSE (text/event-stream format).
+    Protocol:
+      1. {\"type\":\"typing\",\"done\":false}           — typing indicator
+      2. {\"type\":\"token\",\"token\":\"...\",\"done\":false} — streaming tokens
+      3. {\"type\":\"done\",\"suggestions\":[...]}      — final event with quick replies
     """
     async def sse_generator() -> AsyncGenerator[str, None]:
         try:
-            # 1. Run the agent logic to fetch the synthesized response
-            # Note: In a larger app we can stream directly from HuggingFace chunks,
-            # but to ensure database checks compile successfully in the LangGraph state machine,
-            # we run the graph fully and stream the output tokens with minimal delay (typing simulation).
-            response_text = await agent_service.run_agent(
+            # 1. Fire typing indicator immediately so frontend can show spinner
+            typing_event = {"type": "typing", "done": False}
+            yield f"data: {json.dumps(typing_event)}\n\n"
+            await asyncio.sleep(0.05)
+
+            # 2. Run the agent logic — returns (response_text, suggestions)
+            response_text, suggestions = await agent_service.run_agent(
                 db=db,
                 session_key=req.session_key,
                 user_message=req.message
             )
 
-            # 2. Yield tokens sequentially to recreate a typing effect
-            # Split by words to keep it fluent
+            # 3. Yield tokens sequentially to recreate a typing effect
             words = response_text.split(" ")
             for i, word in enumerate(words):
-                # Add spacing back
                 chunk = word + (" " if i < len(words) - 1 else "")
-                
-                # Format SSE payload matching frontend parsing structure
                 data = {
+                    "type": "token",
                     "token": chunk,
-                    "done": i == len(words) - 1
+                    "done": False,
                 }
                 yield f"data: {json.dumps(data)}\n\n"
-                
-                # Dynamic pacing (fast typing effect)
                 await asyncio.sleep(0.04)
 
+            # 4. Final done event with contextual quick-reply suggestions
+            done_data = {
+                "type": "done",
+                "done": True,
+                "suggestions": suggestions or [],
+            }
+            yield f"data: {json.dumps(done_data)}\n\n"
+
         except Exception as e:
-            # Yield error event
-            err_data = {"error": str(e), "done": True}
+            err_data = {"type": "error", "error": str(e), "done": True}
             yield f"data: {json.dumps(err_data)}\n\n"
 
     return StreamingResponse(

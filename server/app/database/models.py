@@ -79,6 +79,32 @@ class Product(Base):
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
 
+    # Relationships
+    reviews: Mapped[List["ProductReview"]] = relationship(
+        "ProductReview", back_populates="product", lazy="selectin"
+    )
+
+
+# ─── Product Reviews Model ────────────────────────────────────────────────────
+class ProductReview(Base):
+    __tablename__ = "product_reviews"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    product_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("products.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    reviewer_name: Mapped[str] = mapped_column(String(150), nullable=False, default="Customer")
+    rating: Mapped[int] = mapped_column(Integer, nullable=False)  # 1-5
+    review_text: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    # Relationships
+    product: Mapped["Product"] = relationship("Product", back_populates="reviews")
+
 
 # ─── Orders Model ─────────────────────────────────────────────────────────────
 class Order(Base):

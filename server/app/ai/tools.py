@@ -274,3 +274,152 @@ async def db_get_faq(db: AsyncSession, query: str) -> List[Dict[str, Any]]:
         {"question": f.question, "answer": f.answer, "category": f.category}
         for f in faqs
     ]
+
+
+async def db_get_product_reviews(
+    db: AsyncSession, query: str, limit: int = 3
+) -> List[Dict[str, Any]]:
+    """
+    Fetch real review text for a product by name/brand keyword.
+    Returns list of {reviewer_name, rating, review_text, product_name}.
+    """
+    if not query:
+        return []
+
+    tokens = [t for t in re.split(r"\s+", query.lower()) if len(t) >= 2]
+    if not tokens:
+        return []
+
+    # First find the matching product(s)
+    name_clauses = []
+    for t in tokens:
+        like = f"%{t}%"
+        name_clauses.extend([
+            models.Product.name.ilike(like),
+            models.Product.brand.ilike(like),
+        ])
+
+    prod_stmt = (
+        select(models.Product)
+        .where(models.Product.is_active.is_(True), or_(*name_clauses))
+        .limit(3)
+    )
+    prod_result = await db.execute(prod_stmt)
+    products = prod_result.scalars().all()
+
+    if not products:
+        return []
+
+    product_ids = [p.id for p in products]
+    product_name_map = {p.id: p.name for p in products}
+
+    # Fetch reviews for those products
+    rev_stmt = (
+        select(models.ProductReview)
+        .where(models.ProductReview.product_id.in_(product_ids))
+        .order_by(models.ProductReview.rating.desc(), models.ProductReview.created_at.desc())
+        .limit(limit)
+    )
+    rev_result = await db.execute(rev_stmt)
+    reviews = rev_result.scalars().all()
+
+    return [
+        {
+            "product_name": product_name_map.get(r.product_id, "Product"),
+            "reviewer_name": r.reviewer_name,
+            "rating": r.rating,
+            "review_text": r.review_text,
+        }
+        for r in reviews
+    ]
+
+
+async def db_initiate_return(
+    db: AsyncSession, order_ref: str, reason: str = "Customer requested return"
+) -> Dict[str, Any]:
+    """
+    Full return initiation pipeline:
+    1. Find order by number
+    2. Check eligibility (status must be delivered/completed)
+    3. Check no existing return
+    4. Create return record → RET-XXXXXX
+    Returns structured dict with success/error info.
+    """
+    # Step 1: Resolve order
+    clean = order_ref.strip().upper().replace(" ", "")
+    digits = re.sub(r"[^A-Z0-9]", "", clean)
+    candidates = {clean, f"SE-{digits}", f"ORD-{digits}", digits}
+
+    stmt = select(models.Order).where(models.Order.order_number.in_(list(candidates)))
+    try:
+        order_uuid = UUID(order_ref.strip())
+        stmt = select(models.Order).where(
+            or_(models.Order.id == order_uuid, models.Order.order_number.in_(list(candidates)))
+        )
+    except (ValueError, AttributeError):
+        pass
+
+    result = await db.execute(stmt)
+    order = result.scalar_one_or_none()
+
+    if not order:
+        return {
+            "success": False,
+            "error": (
+                f"As-salamu alaykum! Order **{order_ref}** hamara system me nahi mila. "
+                "Kindly apna correct order number share karein (e.g. **SE-9821** ya **ORD-1023**). Shukriya!"
+            ),
+        }
+
+    # Step 2: Eligibility check
+    eligible_statuses = {"delivered", "completed"}
+    if order.status.lower() not in eligible_statuses:
+        return {
+            "success": False,
+            "error": (
+                f"Order **#{order.order_number}** abhi **{order.status.replace('_',' ').title()}** status me hai. "
+                "Return sirf **delivered** orders ke liye available hai. "
+                "Jab order deliver ho jaye to return initiate kar saktay hain. Shukriya!"
+            ),
+        }
+
+    # Step 3: Check existing return
+    existing_stmt = select(models.Return).where(models.Return.order_id == order.id)
+    existing_result = await db.execute(existing_stmt)
+    existing_return = existing_result.scalar_one_or_none()
+
+    if existing_return:
+        return {
+            "success": False,
+            "already_exists": True,
+            "return_number": existing_return.return_number,
+            "status": existing_return.status,
+            "error": (
+                f"Order **#{order.order_number}** ke liye pehle se return request **{existing_return.return_number}** "
+                f"exist karti hai — status: **{existing_return.status.replace('_',' ').title()}**. "
+                "Agar aur help chahiye to humse sampark karein. Shukriya!"
+            ),
+        }
+
+    # Step 4: Create return record
+    import uuid as _uuid
+    ret_num = f"RET-{_uuid.uuid4().hex[:6].upper()}"
+    new_return = models.Return(
+        return_number=ret_num,
+        order_id=order.id,
+        reason=reason,
+        status="requested",
+        refund_amount=float(order.total_amount),
+    )
+    db.add(new_return)
+    await db.commit()
+    await db.refresh(new_return)
+
+    return {
+        "success": True,
+        "return_number": ret_num,
+        "order_number": order.order_number,
+        "refund_amount": float(order.total_amount),
+        "status": "requested",
+        "reason": reason,
+    }

@@ -106,6 +106,24 @@ class ProductResponse(ProductBase):
     model_config = ConfigDict(from_attributes=True)
 
 
+# ─── Product Review Schemas ───────────────────────────────────────────────────
+class ProductReviewCreate(BaseModel):
+    reviewer_name: str = "Customer"
+    rating: int = Field(ge=1, le=5)
+    review_text: str
+
+
+class ProductReviewResponse(BaseModel):
+    id: UUID
+    product_id: UUID
+    reviewer_name: str
+    rating: int
+    review_text: str
+    created_at: datetime
+
+    model_config = ConfigDict(from_attributes=True)
+
+
 # ─── Order Schemas ────────────────────────────────────────────────────────────
 class OrderCreate(BaseModel):
     customer_name: Optional[str] = None
