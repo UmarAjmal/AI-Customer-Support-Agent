@@ -1,0 +1,19 @@
+version: '3.8'
+
+services:
+  shopease-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: shopease-backend
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    volumes:
+      - uploads_data:/app/static/uploads
+    restart: always
+
+volumes:
+  uploads_data:
+    driver: local
