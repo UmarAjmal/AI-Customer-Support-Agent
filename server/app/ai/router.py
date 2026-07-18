@@ -125,10 +125,20 @@ def _local_classify(message: str) -> tuple[str, float]:
         ):
             return "OFF_TOPIC", 0.95
 
-    # Pure greetings only (short standalone) — NOT "kya ha" inside product questions
-    if any(re.search(p, text, re.I) for p in GREETING_PATTERNS) and len(text.split()) <= 6:
+    # stand-alone greetings & user name introductions (local high confidence checks)
+    is_greeting = any(re.search(p, text, re.I) for p in GREETING_PATTERNS)
+    is_intro = any(re.search(p, text, re.I) for p in [
+        r"\bmera\s+na+m\b",      # "mera naam", "mera nam"
+        r"\bmy\s+name\b",         # "my name"
+        r"\bi\s+am\b",            # "i am"
+        r"\bnaam\s+kya\b",        # "naam kya"
+        r"\bnam\s+kya\b",         # "nam kya"
+        r"\bname\s+kya\b",        # "name kya"
+    ])
+    
+    if (is_greeting or is_intro) and len(text.split()) <= 8:
         if not _has_product_signal(text) and not any(
-            k in text for k in ["order", "return", "track", "shipping", "payment", "policy"]
+            k in text for k in ["order", "return", "track", "shipping", "payment", "policy", "cost", "price", "qeemat"]
         ):
             return "GENERAL_CHAT", 0.92
 

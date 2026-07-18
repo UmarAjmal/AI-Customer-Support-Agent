@@ -51,6 +51,76 @@ async def get_chat_session(
     return JSONResponse(content={"session_key": key})
 
 
+@router.get("/diagnose")
+async def chat_diagnose(request: Request):
+    """
+    Diagnostic endpoint to troubleshoot LLM connectivity issues on production (Render).
+    """
+    import socket
+    import httpx
+    from app.core.config import settings
+
+    results = {
+        "groq_api_key_set": bool(settings.GROQ_API_KEY),
+        "hf_api_key_set": bool(settings.HUGGINGFACE_API_KEY),
+        "hf_model_id": settings.HF_MODEL_ID,
+        "dns_resolutions": {},
+        "tests": {}
+    }
+
+    # Test DNS
+    for host in ["google.com", "api.groq.com", "api-inference.huggingface.co"]:
+        try:
+            ip = socket.gethostbyname(host)
+            results["dns_resolutions"][host] = f"SUCCESS (IP: {ip})"
+        except Exception as e:
+            results["dns_resolutions"][host] = f"FAILED ({e})"
+
+    # Test Groq LLM
+    if settings.GROQ_API_KEY:
+        try:
+            url = "https://api.groq.com/openai/v1/chat/completions"
+            headers = {
+                "Authorization": f"Bearer {settings.GROQ_API_KEY}",
+                "Content-Type": "application/json",
+            }
+            payload = {
+                "model": settings.GROQ_MODEL,
+                "messages": [{"role": "user", "content": "Hello"}],
+                "temperature": 0.1,
+                "max_tokens": 5,
+            }
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                resp = await client.post(url, json=payload, headers=headers)
+                results["tests"]["groq"] = {
+                    "status_code": resp.status_code,
+                    "response": resp.json() if resp.status_code == 200 else resp.text[:200]
+                }
+        except Exception as e:
+            results["tests"]["groq"] = f"CRASHED ({e})"
+    else:
+        results["tests"]["groq"] = "SKIP (No API Key)"
+
+    # Test Hugging Face LLM
+    if settings.HUGGINGFACE_API_KEY:
+        try:
+            url = f"https://api-inference.huggingface.co/models/{settings.HF_MODEL_ID}"
+            headers = {"Authorization": f"Bearer {settings.HUGGINGFACE_API_KEY}"}
+            payload = {"inputs": "<s>[INST] Hello [/INST]", "parameters": {"max_new_tokens": 5}}
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                resp = await client.post(url, json=payload, headers=headers)
+                results["tests"]["hf"] = {
+                    "status_code": resp.status_code,
+                    "response": resp.json() if resp.status_code == 200 else resp.text[:200]
+                }
+        except Exception as e:
+            results["tests"]["hf"] = f"CRASHED ({e})"
+    else:
+        results["tests"]["hf"] = "SKIP (No API Key)"
+
+    return results
+
+
 @router.post("/stream")
 async def chat_stream(
     request: Request,
