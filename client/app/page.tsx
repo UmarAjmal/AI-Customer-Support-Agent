@@ -162,13 +162,7 @@ function HomeContent() {
             >
               Elevate Your Lifestyle with ShopEase
             </h1>
-            <p
-              className="text-lg mb-8 max-w-lg leading-relaxed"
-              style={{ color: "var(--color-on-surface-variant)", fontFamily: "var(--font-body-lg)" }}
-            >
-              {/* Discover the finest curated selection of electronics, global fashion, and authentic Pakistani
-              craftsmanship delivered to your doorstep. */}
-            </p>
+            
             <div className="flex flex-wrap gap-4">
               <Link
                 href="/products"
