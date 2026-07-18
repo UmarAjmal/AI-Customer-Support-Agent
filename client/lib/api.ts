@@ -1,7 +1,7 @@
 import { Product, Order, OrderItem } from "../types/chat";
 
-const API_BASE =
-  process.env.NEXT_PUBLIC_API_URL || "https://ai-customer-support-agent-dchb.onrender.com/api";
+const rawUrl = (process.env.NEXT_PUBLIC_API_URL || "https://ai-customer-support-agent-dchb.onrender.com/api").replace(/\/$/, "");
+const API_BASE = rawUrl.endsWith("/api") ? rawUrl : `${rawUrl}/api`;
 
 /** Short in-memory cache so page navigations feel instant */
 const CACHE_TTL_MS = 60_000;

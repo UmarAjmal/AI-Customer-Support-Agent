@@ -24,6 +24,11 @@ const LOCAL_STORAGE_KEY = "shopease-chat-history";
 const LOCAL_STORAGE_OPEN_KEY = "shopease-chat-open";
 const LOCAL_STORAGE_HANDOFF_KEY = "shopease-chat-handoff";
 
+const getBackendUrl = () => {
+  const rawUrl = (process.env.NEXT_PUBLIC_API_URL || "https://ai-customer-support-agent-dchb.onrender.com/api").replace(/\/$/, "");
+  return rawUrl.endsWith("/api") ? rawUrl : `${rawUrl}/api`;
+};
+
 export const AgentProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
   const [messages, setMessages] = useState<Message[]>([]);
   const [isOpen, setIsOpen] = useState(false);
@@ -49,7 +54,7 @@ export const AgentProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     }
 
     // Fetch a new signed session key from the server
-    const apiBase = process.env.NEXT_PUBLIC_API_URL || "https://ai-customer-support-agent-dchb.onrender.com/api";
+    const apiBase = getBackendUrl();
     fetch(`${apiBase}/chat/session`)
       .then((r) => r.json())
       .then((data) => {
@@ -280,8 +285,7 @@ export const AgentProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     setMessages((prev) => [...prev, initialMessage]);
     
     let currentContent = "";
-    const backendUrl =
-      process.env.NEXT_PUBLIC_API_URL || "https://ai-customer-support-agent-dchb.onrender.com/api";
+    const backendUrl = getBackendUrl();
 
     try {
       const response = await fetch(`${backendUrl}/chat/stream`, {
