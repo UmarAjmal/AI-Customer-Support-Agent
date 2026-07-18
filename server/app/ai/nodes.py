@@ -194,12 +194,13 @@ def _resolve_order_ref(current_msg: str, history_list: List[Dict[str, Any]]) -> 
     ref = _extract_order_ref(current_msg)
     if ref:
         return ref
-    # 2. Walk history backwards to find last active order reference
+    # 2. Walk history backwards to find last active order reference (only in user messages)
     for turn in reversed(history_list):
-        content = turn.get("content", "")
-        found = _extract_order_ref(content)
-        if found:
-            return found
+        if turn.get("role") == "user":
+            content = turn.get("content", "")
+            found = _extract_order_ref(content)
+            if found:
+                return found
     return None
 
 

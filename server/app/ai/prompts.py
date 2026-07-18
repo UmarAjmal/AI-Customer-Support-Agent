@@ -49,7 +49,7 @@ You classify ShopEase customer messages. Pick EXACTLY one label:
 - RETURN_ITEM: return, refund, exchange status
 - FAQ: shipping, payment, COD, warranty, contact, hours, policy
 - HUMAN_SUPPORT: wants a human agent / complaint escalation
-- GENERAL_CHAT: short greeting, thanks, bye, or asking who you are (shop context)
+- GENERAL_CHAT: greetings, user name introductions, small talk, thanks, bye, or asking who you are (shop context)
 - OFF_TOPIC: anything NOT about ShopEase shopping/support (news, sports, homework, coding, general trivia, other companies, medical/legal, etc.)
 
 Output ONLY the label name.

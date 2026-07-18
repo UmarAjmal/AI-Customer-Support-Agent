@@ -66,6 +66,7 @@ SHOP_KEYWORDS = PRODUCT_SIGNALS + [
     "easypaisa", "jazzcash", "warranty", "shop", "shopease", "recommend",
     "suggest", "faq", "policy", "support", "agent", "human", "brand",
     "category", "fashion", "electronics", "checkout",
+    "naam", "nam", "name", "salam", "hello", "hi", "hey", "aoa", "assalam", "helo", "hy", "yo",
 ]
 
 OFF_TOPIC_KEYWORDS = [
@@ -284,8 +285,8 @@ async def classify_intent(message: str) -> str:
 
     hf_intent = await _hf_classify(message)
     if hf_intent:
-        # Prefer local product signal over HF greeting mistakes
-        if local_intent == "PRODUCT_SEARCH" and hf_intent in ["GENERAL_CHAT", "OFF_TOPIC"]:
+        # Prefer local product signal over LLM greeting mistakes ONLY if actual product signal is detected
+        if local_intent == "PRODUCT_SEARCH" and _has_product_signal(message.strip().lower()) and hf_intent in ["GENERAL_CHAT", "OFF_TOPIC"]:
             logger.info("intent.classified", intent="PRODUCT_SEARCH", source="local_override")
             return "PRODUCT_SEARCH"
         logger.info("intent.classified", intent=hf_intent, source="hf_api")
