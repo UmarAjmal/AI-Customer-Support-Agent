@@ -338,11 +338,15 @@ export const AgentProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         }
       }
     } catch (error) {
-      console.warn("Backend error, falling back to client DB-backed simulation...", error);
+      console.error("Backend connection failed:", error);
       
-      // FALLBACK: still pull live catalog/orders from API when chat stream is down
-      const { text, products, order } = await processAgentResponseFallback(userText);
-      const words = text.split(" ");
+      const errorMsg = (
+        "⚠️ **Connection to ShopEase AI Server Failed.**\n\n" +
+        "Please check if your backend server is running locally (usually on port 8000) or check the Render deployment status.\n\n" +
+        "*Tip for developers*: Make sure `NEXT_PUBLIC_API_URL` in `client/.env.local` points to `http://localhost:8000/api` if you are testing local changes."
+      );
+      
+      const words = errorMsg.split(" ");
       currentContent = "";
 
       for (let i = 0; i < words.length; i++) {
@@ -361,14 +365,13 @@ export const AgentProvider: React.FC<{ children: React.ReactNode }> = ({ childre
           messagesEndRef.current.scrollIntoView({ behavior: "smooth" });
         }
 
-        await new Promise((resolve) => setTimeout(resolve, 35 + Math.random() * 20));
+        await new Promise((resolve) => setTimeout(resolve, 15));
       }
 
-      // Finish with potential product/order metadata attached
       setMessages((prev) => {
         const final = prev.map((msg) =>
           msg.id === botMessageId
-            ? { ...msg, content: currentContent, isStreaming: false, products, order }
+            ? { ...msg, content: currentContent, isStreaming: false }
             : msg
         );
         localStorage.setItem(LOCAL_STORAGE_KEY, JSON.stringify(final));

@@ -258,9 +258,6 @@ async def classify_intent(message: str) -> str:
 
     hf_intent = await _hf_classify(message)
     if hf_intent:
-        if local_intent == "OFF_TOPIC" and hf_intent == "GENERAL_CHAT":
-            logger.info("intent.classified", intent="OFF_TOPIC", source="local_override")
-            return "OFF_TOPIC"
         # Prefer local product signal over HF greeting mistakes
         if local_intent == "PRODUCT_SEARCH" and hf_intent in ["GENERAL_CHAT", "OFF_TOPIC"]:
             logger.info("intent.classified", intent="PRODUCT_SEARCH", source="local_override")

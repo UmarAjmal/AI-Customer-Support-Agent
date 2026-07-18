@@ -129,8 +129,7 @@ async def db_search_products(db: AsyncSession, query: str) -> List[Dict[str, Any
             return any(b in blob for b in brands_in_q)
 
         branded = [p for p in ranked if brand_ok(p)]
-        if branded:
-            ranked = branded
+        ranked = branded  # If empty, return empty list instead of falling back to other brands
 
     # For tight brand+model queries, prefer top match only when clearly ahead
     if len(ranked) > 1 and score(ranked[0]) >= score(ranked[1]) + 3:
