@@ -48,8 +48,9 @@ export const AgentProvider: React.FC<{ children: React.ReactNode }> = ({ childre
       return;
     }
 
-    // Fetch a new signed session key from the server via the rewrite proxy
-    fetch("/backend-api/chat/session")
+    // Fetch a new signed session key from the server
+    const apiBase = process.env.NEXT_PUBLIC_API_URL || "https://ai-customer-support-agent-dchb.onrender.com/api";
+    fetch(`${apiBase}/chat/session`)
       .then((r) => r.json())
       .then((data) => {
         const key = data.session_key as string;
@@ -280,9 +281,7 @@ export const AgentProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     
     let currentContent = "";
     const backendUrl =
-      typeof window !== "undefined"
-        ? "/backend-api"
-        : process.env.NEXT_PUBLIC_API_URL || "https://ai-customer-support-agent-dchb.onrender.com/api";
+      process.env.NEXT_PUBLIC_API_URL || "https://ai-customer-support-agent-dchb.onrender.com/api";
 
     try {
       const response = await fetch(`${backendUrl}/chat/stream`, {

@@ -1,9 +1,7 @@
 import { Product, Order, OrderItem } from "../types/chat";
 
 const API_BASE =
-  typeof window !== "undefined"
-    ? "/backend-api"
-    : process.env.NEXT_PUBLIC_API_URL || "https://ai-customer-support-agent-dchb.onrender.com/api";
+  process.env.NEXT_PUBLIC_API_URL || "https://ai-customer-support-agent-dchb.onrender.com/api";
 
 /** Short in-memory cache so page navigations feel instant */
 const CACHE_TTL_MS = 60_000;
