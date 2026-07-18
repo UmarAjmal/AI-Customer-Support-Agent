@@ -48,9 +48,8 @@ export const AgentProvider: React.FC<{ children: React.ReactNode }> = ({ childre
       return;
     }
 
-    // Fetch a new signed session key from the server
-    const API_BASE = process.env.NEXT_PUBLIC_API_URL || "https://ai-customer-support-agent-dchb.onrender.com";
-    fetch(`${API_BASE}/api/chat/session`)
+    // Fetch a new signed session key from the server via the rewrite proxy
+    fetch("/backend-api/chat/session")
       .then((r) => r.json())
       .then((data) => {
         const key = data.session_key as string;
@@ -298,6 +297,9 @@ export const AgentProvider: React.FC<{ children: React.ReactNode }> = ({ childre
       });
 
       if (!response.ok || !response.body) {
+        if (response.status === 401 || response.status === 403) {
+          localStorage.removeItem("shopease-session-key");
+        }
         throw new Error("Backend connection failed");
       }
 
