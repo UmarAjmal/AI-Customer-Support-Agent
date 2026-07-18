@@ -54,14 +54,10 @@ URDU_PRICE_PATTERNS = [
     r"\bkitn[aei]\b",
     r"\bqeemat\b",
     r"\brs\.?\b",
-    r"\bkya\s+ha[ei]?\b",
-    r"\bkya\s+hai\b",
     r"\bkitne\s+ka\b",
     r"\bkitni\s+hai\b",
     r"\bprice\s+kya\b",
     r"\bprice\s+batao\b",
-    r"\bbatao\b",
-    r"\bbtao\b",
 ]
 
 SHOP_KEYWORDS = PRODUCT_SIGNALS + [
@@ -202,10 +198,10 @@ def _local_classify(message: str) -> tuple[str, float]:
         return "PRODUCT_SEARCH", 0.95
 
     if not any(k in text for k in SHOP_KEYWORDS) and len(text.split()) > 3:
-        return "OFF_TOPIC", 0.88
+        return "OFF_TOPIC", 0.5
 
     if not any(k in text for k in SHOP_KEYWORDS):
-        return "OFF_TOPIC", 0.8
+        return "OFF_TOPIC", 0.5
 
     # Shop-related but unclear → try product search rather than greeting
     return "PRODUCT_SEARCH", 0.7

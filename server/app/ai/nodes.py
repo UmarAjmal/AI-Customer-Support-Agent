@@ -189,6 +189,20 @@ def _extract_order_ref(message: str) -> Optional[str]:
     return None
 
 
+def _resolve_order_ref(current_msg: str, history_list: List[Dict[str, Any]]) -> Optional[str]:
+    # 1. Try to extract from current message
+    ref = _extract_order_ref(current_msg)
+    if ref:
+        return ref
+    # 2. Walk history backwards to find last active order reference
+    for turn in reversed(history_list):
+        content = turn.get("content", "")
+        found = _extract_order_ref(content)
+        if found:
+            return found
+    return None
+
+
 def _format_order(order: Dict[str, Any]) -> str:
     items = order.get("items") or []
     items_txt = ", ".join(items) if items else "See order details in My Orders"
@@ -533,7 +547,7 @@ async def query_db_node(state: AgentState, db: AsyncSession) -> Dict[str, Any]:
                     logger.warning("query_db_node.upsell_failed", error=str(upsell_err))
 
         elif intent == "RETURN_ITEM":
-            order_ref = _extract_order_ref(message)
+            order_ref = _resolve_order_ref(message, history)
             lower_msg = message.lower()
 
             # Detect INITIATION intent vs STATUS CHECK
@@ -581,7 +595,7 @@ async def query_db_node(state: AgentState, db: AsyncSession) -> Dict[str, Any]:
                 }
 
         elif intent == "ORDER_TRACKING":
-            order_ref = _extract_order_ref(message)
+            order_ref = _resolve_order_ref(message, history)
             if not order_ref:
                 db_results = {
                     "error": (
@@ -677,6 +691,28 @@ async def generate_response_node(state: AgentState) -> Dict[str, Any]:
         "PRODUCT_RECOMMENDATION",
         "PRODUCT_REVIEW",
     ]:
+        if intent == "GENERAL_CHAT":
+            # Call Groq to reply naturally to greetings/thanks/chat with shop context and memory
+            history_str = ""
+            for msg in history[-6:]:
+                history_str += f"{msg.get('role', 'user').capitalize()}: {msg.get('content', '')}\n"
+            prompt = f"""<s>[INST] {SYSTEM_PROMPT}
+
+Recent Conversation:
+{history_str}
+User: {message}
+
+Write a short, warm, and friendly response (under 45 words) in Roman Urdu or English acknowledging the user's greeting/chat.
+Remember context details (like their name or current topic) if shared in the conversation history. Keep it focused on ShopEase.
+STRICT RULE: Do not make up or hallucinate any custom coupon codes, sales events, or extra discount offers. [/INST]"""
+            llm = await call_llm(prompt)
+            if llm and len(llm) > 10:
+                suggestions = _get_suggestions(intent, db_results)
+                return {"response": llm, "suggestions": suggestions}
+            # Fallback to static
+            suggestions = _get_suggestions(intent, db_results)
+            return {"response": deterministic, "suggestions": suggestions}
+
         # For products, optional light LLM polish only if user asked a complex compare/recommend question
         complex_ask = any(
             w in message.lower()
@@ -695,7 +731,8 @@ Recent Conversation:
 {history_str}
 User: {message}
 
-Write a short professional ShopEase reply comparing/recommending ONLY from the database results. [/INST]"""
+Write a short professional ShopEase reply comparing/recommending ONLY from the database results.
+STRICT RULE: Stick strictly to the prices and discount/scarcity details in the database. Never make up or hallucinate any custom coupons, discount codes, or sales offers. [/INST]"""
             llm = await call_llm(prompt)
             if llm and len(llm) > 40:
                 suggestions = _get_suggestions(intent, db_results)
