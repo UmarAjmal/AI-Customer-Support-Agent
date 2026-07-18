@@ -111,6 +111,8 @@ def _local_classify(message: str) -> tuple[str, float]:
         "system prompt", "dan mode", "jailbreak", "developer mode", "override",
         "print your rules", "reveal your instructions", "forget your support domain",
         "write a python", "write python", "write a script", "programming code",
+        "prompt batao", "rules batao", "instructions batao", "batao rules",
+        "system instructions",
     ]
     if any(term in text for term in jailbreak_terms):
         return "OFF_TOPIC", 1.0
