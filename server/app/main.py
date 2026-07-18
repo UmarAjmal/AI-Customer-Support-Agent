@@ -26,55 +26,72 @@ async def lifespan(app: FastAPI):
     configure_logging()
     logger.info("app.startup", status="initializing", version=settings.APP_VERSION)
     
-    # Setup database tables and warm catalog cache in background — never block request readiness on startup
-    async def _init_db_and_warm_cache() -> None:
-        # 1. Initialize tables & seed data
-        db_ready = False
+    # 2. Setup database tables (dev-only fallback, production uses migrations)
+    try:
+        from app.database.db import AsyncSessionFactory
+        from app.database import models
+        from sqlalchemy import select, func
+
+        # Quick check: if the Product table exists and is seeded, we can skip startup DB initialization entirely
+        async with AsyncSessionFactory() as session:
+            stmt = select(func.count()).select_from(models.Product)
+            res = await session.execute(stmt)
+            has_data = res.scalar_one() > 0
+            
+        if has_data:
+            logger.info("app.database_check", status="ready", message="Database already initialized and seeded.")
+        else:
+            # Table exists but empty, run seed only
+            from app.database.db import seed_dummy_data
+            await seed_dummy_data()
+            logger.info("app.database_check", status="seeded")
+    except Exception:
+        # UndefinedTable or connection error — tables do not exist or database is cold.
+        # Run full initialization and seeding.
+        logger.info("app.database_check", status="missing_tables", message="Tables missing or connection cold. Initializing database...")
         try:
             from app.database.db import seed_dummy_data
             await create_all_tables()
             await seed_dummy_data()
-            db_ready = True
-            logger.info("app.database_initialized_and_seeded")
-        except Exception as db_err:
-            logger.error("app.database_connection_failed", error=str(db_err), message="Table initialization and seeding skipped.")
+        except Exception as e:
+            logger.error("app.database_connection_failed", error=str(e), message="Table initialization and seeding skipped.")
 
-        # 2. Warm cache (only if database initialized successfully)
-        if db_ready:
-            try:
-                from app.core import ttl_cache
-                from app.database.db import AsyncSessionFactory
-                from app.services import product_service
-                from app.database import schemas
+    # Warm catalog in background — never block request readiness
+    async def _warm_catalog_cache() -> None:
+        try:
+            from app.core import ttl_cache
+            from app.database.db import AsyncSessionFactory
+            from app.services import product_service
+            from app.database import schemas
 
-                async with AsyncSessionFactory() as session:
-                    products, total = await product_service.list_products(
-                        db=session, page=1, page_size=50
-                    )
-                    items = [
-                        schemas.ProductResponse.model_validate(p).model_dump(mode="json")
-                        for p in products
-                    ]
-                    ttl_cache.set(
-                        "products:None:None:None:None:None:1:50",
-                        {"items": items, "total": total, "page": 1, "page_size": 50},
-                        60.0,
-                    )
-                    cats = await product_service.list_categories(session)
-                    ttl_cache.set(
-                        "categories",
-                        [
-                            schemas.CategoryResponse.model_validate(c).model_dump(mode="json")
-                            for c in cats
-                        ],
-                        120.0,
-                    )
-                logger.info("app.catalog_cache_warmed", products=total)
-            except Exception as warm_err:
-                logger.warning("app.catalog_cache_warm_failed", error=str(warm_err))
+            async with AsyncSessionFactory() as session:
+                products, total = await product_service.list_products(
+                    db=session, page=1, page_size=50
+                )
+                items = [
+                    schemas.ProductResponse.model_validate(p).model_dump(mode="json")
+                    for p in products
+                ]
+                ttl_cache.set(
+                    "products:None:None:None:None:None:1:50",
+                    {"items": items, "total": total, "page": 1, "page_size": 50},
+                    60.0,
+                )
+                cats = await product_service.list_categories(session)
+                ttl_cache.set(
+                    "categories",
+                    [
+                        schemas.CategoryResponse.model_validate(c).model_dump(mode="json")
+                        for c in cats
+                    ],
+                    120.0,
+                )
+            logger.info("app.catalog_cache_warmed", products=total)
+        except Exception as warm_err:
+            logger.warning("app.catalog_cache_warm_failed", error=str(warm_err))
 
     import asyncio
-    asyncio.create_task(_init_db_and_warm_cache())
+    asyncio.create_task(_warm_catalog_cache())
     
     yield
     
