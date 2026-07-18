@@ -597,6 +597,42 @@ async def query_db_node(state: AgentState, db: AsyncSession) -> Dict[str, Any]:
     return {"db_results": db_results}
 
 
+def _format_offline_comparison(products: List[Dict[str, Any]]) -> str:
+    """Format a clean side-by-side comparison and recommendation if the LLM is offline."""
+    non_upsells = [p for p in products if not p.get("is_upsell")]
+    if len(non_upsells) < 2:
+        return ""
+
+    lines = [
+        "⚖️ **ShopEase Side-by-Side Comparison (Offline Mode)**\n\n"
+        "As-salamu alaykum! AI comparison service temporary offline hone ki wajah se product specifications niche hain:\n"
+    ]
+    for p in non_upsells[:3]:
+        price = f"Rs. {int(p['price']):,}"
+        orig = f" ~~Rs. {int(p['original_price']):,}~~" if p.get("original_price") else ""
+        lines.append(
+            f"• **{p['name']}** ({p.get('brand') or 'Store'})\n"
+            f"  - Price: **{price}**{orig}\n"
+            f"  - Customer Rating: ⭐ {p['rating']} ({p['review_count']} reviews)\n"
+            f"  - Specs: {p['description']}\n"
+        )
+    lines.append("\n💡 **Mera Mashwara (Recommendation):**")
+    best_rated = max(non_upsells[:3], key=lambda x: x.get("rating", 0))
+    cheapest = min(non_upsells[:3], key=lambda x: x.get("price", 9999999))
+    
+    if best_rated["id"] == cheapest["id"]:
+        lines.append(
+            f"- **{best_rated['name']}** sabse behtareen choice hai kyunki yeh best-rated bhi hai aur budget-friendly bhi."
+        )
+    else:
+        lines.append(
+            f"- **Best Quality**: Agar rating aur reliability priority hai, toh **{best_rated['name']}** (⭐ {best_rated['rating']}) behtar hai.\n"
+            f"- **Best Budget**: Value-for-money option ke liye **{cheapest['name']}** (Rs. {int(cheapest['price']):,}) behtareen rahega."
+        )
+    lines.append("\nKya main inme se koi item aapke cart me add karun? Shukriya!")
+    return "\n".join(lines)
+
+
 async def generate_response_node(state: AgentState) -> Dict[str, Any]:
     intent = state.get("intent", "GENERAL_CHAT")
     message = state["message"]
@@ -616,10 +652,10 @@ async def generate_response_node(state: AgentState) -> Dict[str, Any]:
         "PRODUCT_RECOMMENDATION",
         "PRODUCT_REVIEW",
     ]:
-        # For products, optional light LLM polish only if user asked a complex compare question
+        # For products, optional light LLM polish only if user asked a complex compare/recommend question
         complex_ask = any(
             w in message.lower()
-            for w in ["compare", "difference", "vs", "versus", "which is better", "worth"]
+            for w in ["compare", "difference", "vs", "versus", "which is better", "worth", "suggest", "best", "konsa"]
         )
         if intent in ["PRODUCT_SEARCH", "PRODUCT_RECOMMENDATION"] and complex_ask and isinstance(db_results, list) and db_results:
             history_str = ""
@@ -639,6 +675,12 @@ Write a short professional ShopEase reply comparing/recommending ONLY from the d
             if llm and len(llm) > 40:
                 suggestions = _get_suggestions(intent, db_results)
                 return {"response": llm, "suggestions": suggestions}
+            
+            # If LLM failed/offline, use the structured offline comparison template
+            offline_comp = _format_offline_comparison(db_results)
+            if offline_comp:
+                suggestions = _get_suggestions(intent, db_results)
+                return {"response": offline_comp, "suggestions": suggestions}
 
         # Generate contextual quick-reply suggestions
         suggestions = _get_suggestions(intent, db_results)
