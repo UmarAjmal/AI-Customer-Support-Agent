@@ -45,6 +45,9 @@ export const AgentProvider: React.FC<{ children: React.ReactNode }> = ({ childre
   useEffect(() => {
     if (typeof window === "undefined") return;
 
+    // Only fetch if sessionKey is empty
+    if (sessionKey) return;
+
     const stored = localStorage.getItem("shopease-session-key");
 
     // Re-use existing signed key if it's a server-signed format (contains 4 colons)
@@ -68,7 +71,7 @@ export const AgentProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         localStorage.setItem("shopease-session-key", fallback);
         setSessionKey(fallback);
       });
-  }, []);
+  }, [sessionKey]);
 
   // Restore state from LocalStorage on mount
   useEffect(() => {
@@ -302,6 +305,7 @@ export const AgentProvider: React.FC<{ children: React.ReactNode }> = ({ childre
       if (!response.ok || !response.body) {
         if (response.status === 401 || response.status === 403) {
           localStorage.removeItem("shopease-session-key");
+          setSessionKey("");
         }
         throw new Error("Backend connection failed");
       }
