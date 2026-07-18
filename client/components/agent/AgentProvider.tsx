@@ -266,7 +266,7 @@ export const AgentProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     const backendUrl =
       typeof window !== "undefined"
         ? "/backend-api"
-        : process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000/api";
+        : process.env.NEXT_PUBLIC_API_URL || "https://ai-customer-support-agent-dchb.onrender.com/api";
 
     try {
       const response = await fetch(`${backendUrl}/chat/stream`, {
