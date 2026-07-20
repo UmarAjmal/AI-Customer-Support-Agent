@@ -14,6 +14,7 @@ from app.ai.router import classify_intent, _local_classify
 from app.ai.tools import (
     db_search_products, db_track_order, db_check_return_status,
     db_get_faq, db_get_product_reviews, db_initiate_return,
+    db_get_user_profile, db_get_upsell_recommendations,
 )
 from app.ai.prompts import (
     SYSTEM_PROMPT,
@@ -514,25 +515,44 @@ def _resolve_context_query(current_msg: str, history_list: List[Dict[str, Any]])
     return None
 
 
-def get_mock_user_profile(name: str) -> Dict[str, Any]:
-    # Match mock customer profile associated with the name
-    clean_name = name if name != "Valued Customer" else "Umar"
+async def get_user_profile(db: Optional[AsyncSession], name: str) -> Dict[str, Any]:
+    """
+    Fetch live user profile from DB. Falls back to a lightweight mock if:
+    - db is not available
+    - no order record found for this customer name
+    """
+    if db is not None:
+        try:
+            live = await db_get_user_profile(db, name)
+            if live:
+                return live
+        except Exception:
+            pass
+
+    # Graceful mock fallback for anonymous / unrecognised users
+    clean_name = name if name != "Valued Customer" else "Guest"
     return {
         "full_name": clean_name,
-        "email": f"{clean_name.lower().replace(' ', '')}@example.com",
-        "phone": "+92 300 1234567",
-        "city": "Karachi",
-        "recent_purchases": [
-            {
-                "order_number": "SE-4392",
-                "items": ["Samsung Galaxy S24 x1"],
-                "total_amount": 85000,
-                "status": "delivered",
-                "date": "2026-07-12",
-            }
-        ],
-        "active_cart": ["Cotton Casual Shirt x1"],
-        "preferred_categories": ["Electronics", "Fashion"],
+        "email": "",
+        "phone": "",
+        "city": "",
+        "recent_purchases": [],
+        "active_cart": [],
+        "preferred_categories": [],
+    }
+
+
+# Keep alias so existing calls to get_mock_user_profile still work
+def get_mock_user_profile(name: str) -> Dict[str, Any]:
+    clean_name = name if name != "Valued Customer" else "Guest"
+    return {
+        "full_name": clean_name,
+        "email": "",
+        "phone": "",
+        "city": "",
+        "recent_purchases": [],
+        "active_cart": [],
+        "preferred_categories": [],
     }
 
 
@@ -716,11 +736,21 @@ async def product_agent_node(state: AgentState, db: AsyncSession) -> Dict[str, A
             except Exception:
                 pass
 
-    # 2. Build RAG context & user profile
+    # 2. Build RAG context & user profile (real DB first, mock fallback)
     user_name = _extract_user_name(history, message)
-    profile = get_mock_user_profile(user_name)
+    profile = await get_user_profile(db, user_name)
     sentiment = _detect_sentiment(message, history)
     suggestions = _get_suggestions(intent, db_results)
+
+    # Proactive upsell: suggest products from preferred categories
+    if profile["preferred_categories"] and not suggestions:
+        try:
+            bought_names = [item for p in profile["recent_purchases"] for item in p.get("items", [])]
+            upsell = await db_get_upsell_recommendations(db, profile["preferred_categories"], exclude_names=bought_names)
+            if upsell:
+                suggestions = [f"Check out: {u['name']}" for u in upsell[:2]] + suggestions
+        except Exception:
+            pass
 
     context_str = (
         f"LOGGED-IN CUSTOMER PROFILE:\n"
@@ -836,9 +866,9 @@ async def order_agent_node(state: AgentState, db: AsyncSession) -> Dict[str, Any
                 "error": f"Order {order_ref} system me nahi mila. Check/re-enter correct ID."
             }
 
-    # 2. Build RAG context & user profile
+    # 2. Build RAG context & user profile (real DB first, mock fallback)
     user_name = _extract_user_name(history, message)
-    profile = get_mock_user_profile(user_name)
+    profile = await get_user_profile(db, user_name)
     sentiment = _detect_sentiment(message, history)
     suggestions = _get_suggestions(intent, db_results)
 
@@ -921,9 +951,9 @@ async def faq_agent_node(state: AgentState, db: AsyncSession) -> Dict[str, Any]:
     if not db_results:
         db_results = await db_get_faq(db, "")
 
-    # 2. Build RAG context & user profile
+    # 2. Build RAG context & user profile (real DB first, mock fallback)
     user_name = _extract_user_name(history, message)
-    profile = get_mock_user_profile(user_name)
+    profile = await get_user_profile(db, user_name)
     sentiment = _detect_sentiment(message, history)
     suggestions = _get_suggestions("FAQ", db_results)
 

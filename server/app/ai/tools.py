@@ -3,12 +3,18 @@ app/ai/tools.py — Live Supabase/Postgres tools for the ShopEase support agent.
 Never invent data — only return what exists in the database.
 """
 import re
+import math
+import httpx
 from typing import Any, Dict, List, Optional
 from uuid import UUID
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, or_, and_
 
 from app.database import models
+from app.core.config import settings
+from app.core.logger import get_logger
+
+logger = get_logger(__name__)
 
 
 def _derive_carrier(tracking: Optional[str]) -> str:
@@ -41,7 +47,6 @@ def _product_dict(p: models.Product) -> Dict[str, Any]:
     }
 
 
-import math
 from collections import Counter
 
 class SimpleTFIDF:
@@ -222,6 +227,39 @@ async def db_search_products(db: AsyncSession, query: str) -> List[Dict[str, Any
     ranked = [x[0] for x in hybrid_ranked if x[1] > 0.02] or [x[0] for x in hybrid_ranked]
 
     return ranked[:5]
+
+
+async def _get_hf_embedding(text: str) -> Optional[List[float]]:
+    """
+    Fetch a sentence embedding from HuggingFace Inference API.
+    Uses all-MiniLM-L6-v2 (384-dim, fast, free-tier friendly).
+    Returns None on any failure so the caller can gracefully fall back.
+    """
+    if not settings.HUGGINGFACE_API_KEY:
+        return None
+    url = "https://api-inference.huggingface.co/models/sentence-transformers/all-MiniLM-L6-v2"
+    headers = {"Authorization": f"Bearer {settings.HUGGINGFACE_API_KEY}"}
+    try:
+        async with httpx.AsyncClient(timeout=6.0) as client:
+            resp = await client.post(url, json={"inputs": text[:512]}, headers=headers)
+            if resp.status_code == 200:
+                data = resp.json()
+                # API returns a list of floats for a single string input
+                if isinstance(data, list) and data and isinstance(data[0], float):
+                    return data
+                # Some versions return nested list [[...]]
+                if isinstance(data, list) and data and isinstance(data[0], list):
+                    return data[0]
+    except Exception as e:
+        logger.debug("hf_embedding.error", error=str(e))
+    return None
+
+
+def _cosine(a: List[float], b: List[float]) -> float:
+    dot = sum(x * y for x, y in zip(a, b))
+    na = math.sqrt(sum(x * x for x in a))
+    nb = math.sqrt(sum(x * x for x in b))
+    return dot / (na * nb) if (na > 0 and nb > 0) else 0.0
 
 
 async def db_track_order(db: AsyncSession, query_str: str) -> Optional[Dict[str, Any]]:
@@ -508,3 +546,94 @@ async def db_initiate_return(
         "status": "requested",
         "reason": reason,
     }
+async def db_get_user_profile(
+    db: AsyncSession, name: str
+) -> Optional[Dict[str, Any]]:
+    """
+    Fetch live user profile from the DB: most recent orders, preferred categories.
+    Falls back gracefully if no matching record found.
+    """
+    if not name or name in ("Valued Customer", ""):
+        return None
+
+    # Try to find orders with this customer name (case-insensitive)
+    stmt = (
+        select(models.Order)
+        .where(models.Order.customer_name.ilike(f"%{name.split()[0]}%"))
+        .order_by(models.Order.created_at.desc())
+        .limit(5)
+    )
+    result = await db.execute(stmt)
+    orders = result.scalars().all()
+
+    if not orders:
+        return None
+
+    recent_purchases = []
+    category_counts: Dict[str, int] = {}
+    for o in orders:
+        items_raw = o.items if isinstance(o.items, list) else []
+        item_names = [f"{i.get('name', 'Item')} x{i.get('quantity', 1)}" for i in items_raw if isinstance(i, dict)]
+        for i in items_raw:
+            cat = i.get("category", "")
+            if cat:
+                category_counts[cat] = category_counts.get(cat, 0) + 1
+        recent_purchases.append({
+            "order_number": o.order_number,
+            "items": item_names,
+            "total_amount": float(o.total_amount),
+            "status": o.status,
+            "date": o.created_at.strftime("%Y-%m-%d"),
+        })
+
+    preferred_categories = sorted(category_counts, key=lambda k: category_counts[k], reverse=True)[:3]
+    first_order = orders[0]
+
+    return {
+        "full_name": first_order.customer_name or name,
+        "email": first_order.customer_email or "",
+        "phone": first_order.customer_phone or "",
+        "city": (first_order.shipping_address or {}).get("city", "") if isinstance(first_order.shipping_address, dict) else "",
+        "recent_purchases": recent_purchases,
+        "preferred_categories": preferred_categories,
+        "active_cart": [],  # cart is client-side; not persisted in this schema
+    }
+
+
+async def db_get_upsell_recommendations(
+    db: AsyncSession,
+    preferred_categories: List[str],
+    exclude_names: Optional[List[str]] = None,
+    limit: int = 2,
+) -> List[Dict[str, Any]]:
+    """
+    Proactive upsell: fetch top-rated products from user's preferred categories
+    that they haven't purchased yet.
+    """
+    if not preferred_categories:
+        return []
+
+    exclude_names = [n.lower() for n in (exclude_names or [])]
+    clauses = [models.Product.category.ilike(f"%{cat}%") for cat in preferred_categories[:2]]
+
+    stmt = (
+        select(models.Product)
+        .where(
+            models.Product.is_active.is_(True),
+            or_(*clauses),
+        )
+        .order_by(models.Product.rating.desc(), models.Product.is_featured.desc())
+        .limit(limit + 5)  # fetch extra then filter locally
+    )
+    result = await db.execute(stmt)
+    products = result.scalars().all()
+
+    recs = []
+    for p in products:
+        if exclude_names and any(ex in p.name.lower() for ex in exclude_names):
+            continue
+        recs.append(_product_dict(p))
+        if len(recs) >= limit:
+            break
+
+    return recs
