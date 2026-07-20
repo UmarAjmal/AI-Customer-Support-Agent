@@ -226,14 +226,24 @@ def _resolve_order_ref(current_msg: str, history_list: List[Dict[str, Any]]) -> 
     ref = _extract_order_ref(current_msg)
     if ref:
         return ref
-    # 2. Walk history backwards to find last active order reference (only in user messages)
+    # 2. Walk history backwards — check user messages first, then assistant messages
+    # This allows recalling order numbers the agent already mentioned (multi-turn context)
     for turn in reversed(history_list):
         if turn.get("role") == "user":
-            content = turn.get("content", "")
-            found = _extract_order_ref(content)
+            found = _extract_order_ref(turn.get("content", ""))
+            if found:
+                return found
+    for turn in reversed(history_list):
+        if turn.get("role") == "assistant":
+            found = _extract_order_ref(turn.get("content", ""))
             if found:
                 return found
     return None
+
+
+def _is_already_greeted(history: List[Dict[str, Any]]) -> bool:
+    """Returns True if the assistant has already responded at least once in this session."""
+    return any(m.get("role") == "assistant" for m in history)
 
 
 def _format_order(order: Dict[str, Any]) -> str:
@@ -611,6 +621,12 @@ Route Label: [/INST]"""
         user_name = _extract_user_name(history, message)
         profile = get_mock_user_profile(user_name)
 
+        already_greeted = _is_already_greeted(history)
+        greeting_instruction = (
+            "Do NOT start with 'As-salamu alaykum' or any greeting — the user has already been welcomed."
+            if already_greeted else
+            "Start with 'As-salamu alaykum' as a warm welcome."
+        )
         chat_prompt = f"""<s>[INST] {SYSTEM_PROMPT}
 
 Recent Conversation History:
@@ -618,8 +634,11 @@ Recent Conversation History:
 User Message: {message}
 Customer Name: {profile['full_name']}
 
-Write a short, warm, and friendly response (under 45 words) in Roman Urdu or English acknowledging the user.
-Address them by their name (e.g. Umar bhai) if appropriate. Keep it focused on ShopEase. Do not offer promotions. [/INST]"""
+Instructions:
+- Write a short, warm, and friendly response (under 45 words) in Roman Urdu or English.
+- Address them by their name (e.g. Umar bhai) if appropriate.
+- Keep it focused on ShopEase. Do not offer promotions.
+- {greeting_instruction} [/INST]"""
         response = await call_llm(chat_prompt)
         if not response:
             response = build_deterministic_reply("GENERAL_CHAT", message, None) or GREETING_REPLY
@@ -729,6 +748,12 @@ async def product_agent_node(state: AgentState, db: AsyncSession) -> Dict[str, A
     for msg in history[-6:]:
         history_str += f"{msg.get('role', 'user').capitalize()}: {msg.get('content', '')}\n"
 
+    already_greeted = _is_already_greeted(history)
+    greeting_instruction = (
+        "Do NOT start with 'As-salamu alaykum' — the user was already welcomed earlier."
+        if already_greeted else
+        "Start with 'As-salamu alaykum'."
+    )
     sentiment_instructions = ""
     if sentiment == "FRUSTRATED":
         sentiment_instructions = (
@@ -750,14 +775,18 @@ Recent Conversation History:
 User Message: {message}
 
 Instructions:
-- Provide a direct, natural response under 50 words in Roman Urdu/English comparison/recommending products.
+- Provide a direct, natural response under 50 words in Roman Urdu/English recommending or comparing products.
 - Address them by name '{profile['full_name']}' if appropriate.
 - Stick strictly to prices and specs in database. Never make up discount codes.
+- {greeting_instruction}
 - {sentiment_instructions} [/INST]"""
 
     response = await call_llm(prompt)
     if not response:
         response = build_deterministic_reply(intent, message, db_results) or GREETING_REPLY
+    # Sentiment escalation: append human handoff offer if frustrated
+    if sentiment == "FRUSTRATED" and "contact" not in response.lower():
+        response += "\n\nAgar aapko further help chahiye to hum aapko human support agent se connect kar sakte hain. 🙏"
 
     return {
         "response": response,
@@ -828,6 +857,12 @@ async def order_agent_node(state: AgentState, db: AsyncSession) -> Dict[str, Any
     for msg in history[-6:]:
         history_str += f"{msg.get('role', 'user').capitalize()}: {msg.get('content', '')}\n"
 
+    already_greeted = _is_already_greeted(history)
+    greeting_instruction = (
+        "Do NOT start with 'As-salamu alaykum' — the user was already welcomed earlier."
+        if already_greeted else
+        "Start with 'As-salamu alaykum'."
+    )
     sentiment_instructions = ""
     if sentiment == "FRUSTRATED":
         sentiment_instructions = (
@@ -849,14 +884,18 @@ Recent Conversation History:
 User Message: {message}
 
 Instructions:
-- Write a direct, natural response under 50 words in Roman Urdu/English helper with order/return status.
+- Write a direct, natural response under 50 words in Roman Urdu/English about order/return status.
 - Address them by name '{profile['full_name']}' if appropriate.
 - Stick strictly to tracking numbers and facts in context. Never hallucinate refund amounts.
+- {greeting_instruction}
 - {sentiment_instructions} [/INST]"""
 
     response = await call_llm(prompt)
     if not response:
         response = build_deterministic_reply(intent, message, db_results) or GREETING_REPLY
+    # Sentiment escalation: offer human handoff if frustrated
+    if sentiment == "FRUSTRATED" and "contact" not in response.lower():
+        response += "\n\nAgar aapko further help chahiye to hum aapko human support agent se connect kar sakte hain. 🙏"
 
     return {
         "response": response,
@@ -897,6 +936,12 @@ async def faq_agent_node(state: AgentState, db: AsyncSession) -> Dict[str, Any]:
     for msg in history[-6:]:
         history_str += f"{msg.get('role', 'user').capitalize()}: {msg.get('content', '')}\n"
 
+    already_greeted = _is_already_greeted(history)
+    greeting_instruction = (
+        "Do NOT start with 'As-salamu alaykum' — the user was already welcomed earlier."
+        if already_greeted else
+        "Start with 'As-salamu alaykum'."
+    )
     sentiment_instructions = ""
     if sentiment == "FRUSTRATED":
         sentiment_instructions = (
@@ -921,11 +966,15 @@ Instructions:
 - Write a direct, natural response under 50 words in Roman Urdu/English explaining the shop policy facts.
 - Address them by name '{profile['full_name']}' if appropriate.
 - Stick strictly to policy facts in context. Never make up discount rules.
+- {greeting_instruction}
 - {sentiment_instructions} [/INST]"""
 
     response = await call_llm(prompt)
     if not response:
         response = build_deterministic_reply("FAQ", message, db_results) or GREETING_REPLY
+    # Sentiment escalation: offer human handoff if frustrated
+    if sentiment == "FRUSTRATED" and "contact" not in response.lower():
+        response += "\n\nAgar aapko further help chahiye to hum aapko human support agent se connect kar sakte hain. 🙏"
 
     return {
         "response": response,
