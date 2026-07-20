@@ -76,6 +76,7 @@ async def run_agent(
         "response": "",
         "session_key": session_key,
         "suggestions": [],
+        "next_agent": "",
     }
 
     logger.info("agent.execution_started", session_key=session_key)

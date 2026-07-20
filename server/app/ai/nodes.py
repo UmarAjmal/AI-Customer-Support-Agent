@@ -10,7 +10,7 @@ import httpx
 
 from app.core.config import settings
 from app.core.logger import get_logger
-from app.ai.router import classify_intent
+from app.ai.router import classify_intent, _local_classify
 from app.ai.tools import (
     db_search_products, db_track_order, db_check_return_status,
     db_get_faq, db_get_product_reviews, db_initiate_return,
@@ -208,6 +208,7 @@ class AgentState(TypedDict):
     response: str
     session_key: str
     suggestions: List[str]
+    next_agent: str
 
 
 def _extract_order_ref(message: str) -> Optional[str]:
@@ -457,269 +458,50 @@ async def call_llm(prompt: str) -> str:
     return ""
 
 
-async def detect_intent_node(state: AgentState) -> Dict[str, Any]:
-    intent = await classify_intent(state["message"])
-    return {"intent": intent}
-
-
-async def query_db_node(state: AgentState, db: AsyncSession) -> Dict[str, Any]:
-    intent = state.get("intent", "GENERAL_CHAT")
-    message = state["message"]
-    history = state.get("history", [])
-    db_results: Any = None
-
-    # Skip DB for intents that don't need it
-    if intent in ["OFF_TOPIC", "HUMAN_SUPPORT", "GENERAL_CHAT"]:
-        return {"db_results": None}
-
-    # ── Session Context Memory Helper ─────────────────────────────────────────
-    def _resolve_context_query(current_msg: str) -> Optional[str]:
-        """
-        If user message has pronouns (this/it/ye/iska) but no product signal,
-        scan last 4 turns for a product/brand name and return it as the resolved query.
-        """
-        lower = current_msg.lower()
-        pronoun_triggers = [
-            "this", " it ", "is it", "is this", "ye", "iska", "iski", "uska",
-            "that one", "woh", "available", "kitna hai", "price kya",
-        ]
-        has_pronoun = any(p in lower for p in pronoun_triggers)
-        if not has_pronoun:
-            return None
-        # Walk history newest-first to find last mentioned product
-        for turn in reversed(history[-8:]):
-            content = turn.get("content", "")
-            # Look for product names/brands in previous assistant messages
-            for word in content.split():
-                clean = word.strip("*•:,.()").lower()
-                if len(clean) >= 4 and clean not in {
-                    "this", "that", "here", "with", "from", "have",
-                    "your", "price", "rating", "stock", "brand",
-                }:
-                    return clean
-        return None
-
-    try:
-        if intent in ["PRODUCT_SEARCH", "PRODUCT_RECOMMENDATION"]:
-            lower_msg = message.lower()
-
-            # Review query detection (route to review tool)
-            review_kws = ["review", "reviews", "customer review", "ratings", "log kya kehte", "feedback"]
-            if any(w in lower_msg for w in review_kws):
-                keywords = _extract_search_keywords(message)
-                db_results = await db_get_product_reviews(db, keywords)
-                # Treat as PRODUCT_REVIEW intent for formatting
-                return {"db_results": db_results, "intent": "PRODUCT_REVIEW"}
-
-            # Sale/discount detection
-            sale_kws = ["sale", "discount", "offer", "deal", "sasta", "discounts", "sales", "cheap"]
-            if any(w in lower_msg for w in sale_kws):
-                from sqlalchemy import select as sa_select
-                from app.database import models as db_models
-                from app.ai.tools import _product_dict
-                stmt = sa_select(db_models.Product).where(
-                    db_models.Product.original_price > db_models.Product.price,
-                    db_models.Product.is_active.is_(True)
-                ).order_by(db_models.Product.rating.desc()).limit(5)
-                res = await db.execute(stmt)
-                db_results = [_product_dict(p) for p in res.scalars().all()]
-
-            # New arrivals detection — fixed: catches "new phones", "naye", "nayi" etc.
-            elif any(w in lower_msg for w in [
-                "new arrival", "new arrivals", "arrivals", "latest",
-                "naya", "nayay", "naye", "nayi", "new product",
-            ]) or (
-                # Catch "new X" pattern (e.g. "new phones", "new laptops")
-                re.search(r"\bnew\s+\w", lower_msg) and
-                not any(w in lower_msg for w in ["renewal", "renew", "knew"])
-            ):
-                from sqlalchemy import select as sa_select
-                from app.database import models as db_models
-                from app.ai.tools import _product_dict
-                stmt = sa_select(db_models.Product).where(
-                    db_models.Product.is_active.is_(True)
-                ).order_by(db_models.Product.created_at.desc()).limit(5)
-                res = await db.execute(stmt)
-                db_results = [_product_dict(p) for p in res.scalars().all()]
-
-            else:
-                # Session context: resolve pronouns to last mentioned product
-                resolved = _resolve_context_query(message)
-                keywords = _extract_search_keywords(message)
-                if not keywords and resolved:
-                    keywords = resolved
-                elif resolved and len(keywords.split()) <= 2:
-                    # Combine current keywords with context
-                    keywords = f"{resolved} {keywords}".strip()
-                db_results = await db_search_products(db, keywords)
-
-            # Category Upselling Fallback (if exactly 1 product matched)
-            if isinstance(db_results, list) and len(db_results) == 1:
-                try:
-                    product = db_results[0]
-                    category = product.get("category")
-                    product_id = product.get("id")
-                    if category and product_id:
-                        from sqlalchemy import select as sa_select
-                        from app.database import models as db_models
-                        from app.ai.tools import _product_dict
-                        from uuid import UUID
-                        stmt = sa_select(db_models.Product).where(
-                            db_models.Product.category == category,
-                            db_models.Product.id != UUID(product_id),
-                            db_models.Product.is_active.is_(True)
-                        ).order_by(db_models.Product.rating.desc()).limit(2)
-                        alt_res = await db.execute(stmt)
-                        alts = alt_res.scalars().all()
-                        for alt in alts:
-                            alt_dict = _product_dict(alt)
-                            alt_dict["is_upsell"] = True
-                            db_results.append(alt_dict)
-                except Exception as upsell_err:
-                    logger.warning("query_db_node.upsell_failed", error=str(upsell_err))
-
-        elif intent == "RETURN_ITEM":
-            order_ref = _resolve_order_ref(message, history)
-            lower_msg = message.lower()
-
-            # Detect INITIATION intent vs STATUS CHECK
-            initiation_kws = [
-                "want to return", "return karna", "return karna hai", "wapas karna",
-                "initiate return", "return chahta", "return chahti", "return request",
-                "return karun", "return kar", "process return", "mujhe return",
-                "return lena", "wapsi karna",
-            ]
-            wants_initiation = any(k in lower_msg for k in initiation_kws)
-
-            if not order_ref:
-                db_results = {
-                    "error": (
-                        "As-salamu alaykum! Kindly apna order number share karein "
-                        "(e.g. **SE-9821** ya **ORD-1023**) taake hum return process kar sakein. Shukriya!"
-                    )
-                }
-            elif wants_initiation:
-                # Extract reason from message if mentioned
-                reason_kws = {
-                    "damage": "Product received damaged",
-                    "broken": "Product received damaged",
-                    "wrong": "Wrong product received",
-                    "defect": "Product has defect",
-                    "not working": "Product not working",
-                    "size": "Wrong size received",
-                    "quality": "Quality not as expected",
-                }
-                reason = "Customer requested return"
-                for kw, desc in reason_kws.items():
-                    if kw in lower_msg:
-                        reason = desc
-                        break
-                db_results = await db_initiate_return(db, order_ref, reason)
-            else:
-                # Status check
-                found = await db_check_return_status(db, order_ref)
-                db_results = found or {
-                    "error": (
-                        f"Order **{order_ref}** ke liye return details nahi mili. "
-                        "Agar aapka order deliver ho chuka hai, to likhein: "
-                        "*'Return karna hai {order_ref}'* aur hum process shuru kar denge. Shukriya!"
-                    )
-                }
-
-        elif intent == "ORDER_TRACKING":
-            order_ref = _resolve_order_ref(message, history)
-            if not order_ref:
-                db_results = {
-                    "error": (
-                        "As-salamu alaykum! Kindly apna correct order number share karein "
-                        "(e.g. **SE-9821** ya **ORD-1023**) taake hum search kar sakein. Shukriya!"
-                    )
-                }
-            else:
-                found = await db_track_order(db, order_ref)
-                db_results = found or {
-                    "error": (
-                        f"As-salamu alaykum! Mujhe system me order **{order_ref}** nahi mila. "
-                        "Kindly double-check karke correct order ID enter karein. Shukriya!"
-                    )
-                }
-
-        elif intent == "FAQ":
-            lower = message.lower()
-            focus_terms = [
-                "return", "refund", "shipping", "delivery", "payment", "cod",
-                "easypaisa", "jazzcash", "warranty", "contact", "hours", "cancel",
-            ]
-            focus = next((t for t in focus_terms if t in lower), None)
-            keywords = focus or _extract_search_keywords(message) or message
-            db_results = await db_get_faq(db, keywords)
-            if not db_results:
-                db_results = await db_get_faq(db, "")
-
-    except Exception as e:
-        logger.error("query_db_node.db_error", error=str(e))
-        db_results = {
-            "error": (
-                "As-salamu alaykum! I'm having trouble reaching our database right now. "
-                "Kindly try again in a moment, or contact support@shopease.pk. Shukriya!"
-            )
-        }
-
-    return {"db_results": db_results}
-
-
-def _format_offline_comparison(products: List[Dict[str, Any]]) -> str:
-    """Format a clean side-by-side comparison and recommendation if the LLM is offline."""
-    non_upsells = [p for p in products if not p.get("is_upsell")]
-    if len(non_upsells) < 2:
-        return ""
-
-    lines = [
-        "⚖️ **ShopEase Side-by-Side Comparison (Offline Mode)**\n\n"
-        "As-salamu alaykum! AI comparison service temporary offline hone ki wajah se product specifications niche hain:\n"
-    ]
-    for p in non_upsells[:3]:
-        price = f"Rs. {int(p['price']):,}"
-        orig = f" ~~Rs. {int(p['original_price']):,}~~" if p.get("original_price") else ""
-        lines.append(
-            f"• **{p['name']}** ({p.get('brand') or 'Store'})\n"
-            f"  - Price: **{price}**{orig}\n"
-            f"  - Customer Rating: ⭐ {p['rating']} ({p['review_count']} reviews)\n"
-            f"  - Specs: {p['description']}\n"
-        )
-    lines.append("\n💡 **Mera Mashwara (Recommendation):**")
-    best_rated = max(non_upsells[:3], key=lambda x: x.get("rating", 0))
-    cheapest = min(non_upsells[:3], key=lambda x: x.get("price", 9999999))
-    
-    if best_rated["id"] == cheapest["id"]:
-        lines.append(
-            f"- **{best_rated['name']}** sabse behtareen choice hai kyunki yeh best-rated bhi hai aur budget-friendly bhi."
-        )
-    else:
-        lines.append(
-            f"- **Best Quality**: Agar rating aur reliability priority hai, toh **{best_rated['name']}** (⭐ {best_rated['rating']}) behtar hai.\n"
-            f"- **Best Budget**: Value-for-money option ke liye **{cheapest['name']}** (Rs. {int(cheapest['price']):,}) behtareen rahega."
-        )
-    lines.append("\nKya main inme se koi item aapke cart me add karun? Shukriya!")
-    return "\n".join(lines)
-
-
 def _extract_user_name(history: List[Dict[str, Any]], current_msg: str) -> str:
     combined = [current_msg] + [m.get("content", "") for m in reversed(history) if m.get("role") == "user"]
+    question_fillers = {"kya", "kab", "kon", "kaun", "kis", "koon", "what", "who", "kya hai", "kya ha", "nam kya", "naam kya"}
     for text in combined:
         lower = text.lower()
         m1 = re.search(r"\bmera\s+na+m\s+([a-z0-9 ]+?)(?:\s+ha|hai|ba?ta|$)|\bmera\s+na+m\s+([a-z0-9 ]+)", lower)
         if m1:
             val = m1.group(1) or m1.group(2)
-            if val:
+            if val and val.strip().lower() not in question_fillers:
                 return val.strip().title()
         m2 = re.search(r"\bmy\s+name\s+is\s+([a-z0-9 ]+?)(?:$|\.)", lower)
         if m2:
-            return m2.group(1).strip().title()
+            val = m2.group(1)
+            if val and val.strip().lower() not in question_fillers:
+                return val.strip().title()
         m3 = re.search(r"\bi\s+am\s+([a-z0-9 ]+?)(?:$|\.)", lower)
         if m3:
-            return m3.group(1).strip().title()
+            val = m3.group(1)
+            if val and val.strip().lower() not in question_fillers:
+                return val.strip().title()
     return "Valued Customer"
+
+
+def _resolve_context_query(current_msg: str, history_list: List[Dict[str, Any]]) -> Optional[str]:
+    lower = current_msg.lower()
+    pronoun_triggers = [
+        "this", " it ", "is it", "is this", "ye", "iska", "iski", "uska",
+        "that one", "woh", "available", "kitna hai", "price kya",
+    ]
+    has_pronoun = any(p in lower for p in pronoun_triggers)
+    if not has_pronoun:
+        return None
+    # Walk history newest-first to find last mentioned product
+    for turn in reversed(history_list[-8:]):
+        content = turn.get("content", "")
+        # Look for product names/brands in previous assistant messages
+        for word in content.split():
+            clean = word.strip("*•:,.()").lower()
+            if len(clean) >= 4 and clean not in {
+                "this", "that", "here", "with", "from", "have",
+                "your", "price", "rating", "stock", "brand",
+            }:
+                return clean
+    return None
 
 
 def get_mock_user_profile(name: str) -> Dict[str, Any]:
@@ -760,135 +542,202 @@ def _detect_sentiment(current_msg: str, history: List[Dict[str, Any]]) -> str:
     return "NORMAL"
 
 
-async def generate_response_node(state: AgentState) -> Dict[str, Any]:
-    intent = state.get("intent", "GENERAL_CHAT")
+SUPERVISOR_SYSTEM_PROMPT = """You are the Captain (Supervisor) of the ShopEase support agent team.
+Your job is to analyze the user message and history, and route to the correct specialized sub-agent:
+
+- PRODUCT_AGENT: For product searches, brand availability, specifications, recommendations, comparisons, or customer reviews.
+- ORDER_AGENT: For order tracking, delivery status, refund status, or returning/exchanging items.
+- FAQ_AGENT: For general shop policies, shipping speeds, payment options, COD, contact details, or office hours.
+- FINISH: For general greetings, introductions, small talk, acknowledgments ("thank you", "bye"), or off-topic questions.
+
+Output ONLY the target label (PRODUCT_AGENT, ORDER_AGENT, FAQ_AGENT, or FINISH)."""
+
+
+async def supervisor_node(state: AgentState) -> Dict[str, Any]:
+    """
+    Captain/Supervisor agent. Decides next worker routing or exits directly for off-topic/general chat.
+    """
     message = state["message"]
-    db_results = state.get("db_results")
     history = state.get("history", [])
 
-    # Determine fallback and suggestions
-    deterministic = build_deterministic_reply(intent, message, db_results)
-    suggestions = _get_suggestions(intent, db_results)
-
-    # 1. API COST OPTIMIZATION: Early exit for OFF_TOPIC (refusal) and HUMAN_SUPPORT (complaint escalation)
-    if intent == "OFF_TOPIC":
-        return {"response": OFF_TOPIC_REFUSAL, "suggestions": suggestions}
-    if intent == "HUMAN_SUPPORT":
-        return {"response": HUMAN_HANDOFF_REPLY, "suggestions": suggestions}
-
-    # 2. API COST OPTIMIZATION: If user inputs exactly a raw code/tracking number (e.g. "SE-4392"),
-    # bypass the LLM and return the structured template directly.
+    # 1. API COST OPTIMIZATION: Raw order code bypass
     is_raw_code = bool(re.match(r"^\s*(?:se|ord|ret)[- ]?\d{3,6}\s*$", message.strip(), re.I))
-    if is_raw_code and deterministic:
-        return {"response": deterministic, "suggestions": suggestions}
+    if is_raw_code:
+        return {"next_agent": "ORDER_AGENT"}
 
-    # 3. EXTRACT CUSTOMER PROFILE CONTEXT & SENTIMENT
+    # 2. API COST OPTIMIZATION: Local classifier check (Bypasses LLM for off-topic and escalations)
+    local_intent, _ = _local_classify(message)
+    if local_intent == "OFF_TOPIC":
+        return {
+            "next_agent": "FINISH",
+            "intent": "OFF_TOPIC",
+            "response": OFF_TOPIC_REFUSAL,
+            "suggestions": ["Browse products", "Track order", "FAQs"]
+        }
+    if local_intent == "HUMAN_SUPPORT":
+        return {
+            "next_agent": "FINISH",
+            "intent": "HUMAN_SUPPORT",
+            "response": HUMAN_HANDOFF_REPLY,
+            "suggestions": ["Browse products", "Track order", "FAQs"]
+        }
+
+    # 3. Call LLM Supervisor to route
+    history_str = ""
+    for msg in history[-4:]:
+        history_str += f"{msg.get('role', 'user').capitalize()}: {msg.get('content', '')}\n"
+
+    prompt = f"""<s>[INST] {SUPERVISOR_SYSTEM_PROMPT}
+
+Recent Conversation History:
+{history_str}
+User Message: {message}
+
+Route Label: [/INST]"""
+
+    route = await call_llm(prompt)
+    route_clean = route.strip().upper()
+
+    next_agent = "FINISH"
+    for candidate in ["PRODUCT_AGENT", "ORDER_AGENT", "FAQ_AGENT", "FINISH"]:
+        if candidate in route_clean:
+            next_agent = candidate
+            break
+
+    # If FINISH, generate general chat response directly
+    response = ""
+    suggestions = ["Browse products", "Track order", "FAQs"]
+    if next_agent == "FINISH":
+        user_name = _extract_user_name(history, message)
+        profile = get_mock_user_profile(user_name)
+
+        chat_prompt = f"""<s>[INST] {SYSTEM_PROMPT}
+
+Recent Conversation History:
+{history_str}
+User Message: {message}
+Customer Name: {profile['full_name']}
+
+Write a short, warm, and friendly response (under 45 words) in Roman Urdu or English acknowledging the user.
+Address them by their name (e.g. Umar bhai) if appropriate. Keep it focused on ShopEase. Do not offer promotions. [/INST]"""
+        response = await call_llm(chat_prompt)
+        if not response:
+            response = build_deterministic_reply("GENERAL_CHAT", message, None) or GREETING_REPLY
+        suggestions = _get_suggestions("GENERAL_CHAT", None)
+
+    return {
+        "next_agent": next_agent,
+        "response": response,
+        "suggestions": suggestions,
+        "intent": "GENERAL_CHAT" if next_agent == "FINISH" else next_agent
+    }
+
+
+async def product_agent_node(state: AgentState, db: AsyncSession) -> Dict[str, Any]:
+    """
+    Catalog worker. Specialized in specifications, recommendations, and reviews.
+    """
+    message = state["message"]
+    history = state.get("history", [])
+
+    # 1. Fetch DB Results
+    lower_msg = message.lower()
+    db_results = None
+    intent = "PRODUCT_SEARCH"
+
+    # Check reviews
+    review_kws = ["review", "reviews", "customer review", "ratings", "log kya kehte", "feedback"]
+    if any(w in lower_msg for w in review_kws):
+        keywords = _extract_search_keywords(message)
+        db_results = await db_get_product_reviews(db, keywords)
+        intent = "PRODUCT_REVIEW"
+    # Check sales
+    elif any(w in lower_msg for w in ["sale", "discount", "offer", "deal", "sasta", "cheap"]):
+        from sqlalchemy import select as sa_select
+        from app.database import models as db_models
+        from app.ai.tools import _product_dict
+        stmt = sa_select(db_models.Product).where(
+            db_models.Product.original_price > db_models.Product.price,
+            db_models.Product.is_active.is_(True)
+        ).order_by(db_models.Product.rating.desc()).limit(3)
+        res = await db.execute(stmt)
+        db_results = [_product_dict(p) for p in res.scalars().all()]
+    else:
+        # Standard Hybrid Search
+        resolved = _resolve_context_query(message, history)
+        keywords = _extract_search_keywords(message)
+        if not keywords and resolved:
+            keywords = resolved
+        elif resolved and len(keywords.split()) <= 2:
+            keywords = f"{resolved} {keywords}".strip()
+        db_results = await db_search_products(db, keywords)
+
+        # Category upselling fallback
+        if isinstance(db_results, list) and len(db_results) == 1:
+            try:
+                product = db_results[0]
+                category = product.get("category")
+                product_id = product.get("id")
+                if category and product_id:
+                    from sqlalchemy import select as sa_select
+                    from app.database import models as db_models
+                    from app.ai.tools import _product_dict
+                    from uuid import UUID
+                    stmt = sa_select(db_models.Product).where(
+                        db_models.Product.category == category,
+                        db_models.Product.id != UUID(product_id),
+                        db_models.Product.is_active.is_(True)
+                    ).order_by(db_models.Product.rating.desc()).limit(2)
+                    alt_res = await db.execute(stmt)
+                    alts = alt_res.scalars().all()
+                    for alt in alts:
+                        alt_dict = _product_dict(alt)
+                        alt_dict["is_upsell"] = True
+                        db_results.append(alt_dict)
+            except Exception:
+                pass
+
+    # 2. Build RAG context & user profile
     user_name = _extract_user_name(history, message)
     profile = get_mock_user_profile(user_name)
     sentiment = _detect_sentiment(message, history)
+    suggestions = _get_suggestions(intent, db_results)
 
-    # Adapt suggestions for frustrated customers to prioritize help over promotions
-    if sentiment == "FRUSTRATED":
-        suggestions = ["Contact support", "Check return policy", "Track my order"]
-
-    # 4. CONTEXT-AWARE RAG RETRIEVAL: Compile database search results into context
-    context_str = ""
-    
-    # Inject personalized Customer Profile
-    context_str += (
+    context_str = (
         f"LOGGED-IN CUSTOMER PROFILE:\n"
         f"- Name: {profile['full_name']}\n"
-        f"- Email: {profile['email']}\n"
-        f"- Location: {profile['city']}\n"
         f"- Active Cart: {', '.join(profile['active_cart'])}\n"
-        f"- Preferred Categories: {', '.join(profile['preferred_categories'])}\n"
         f"- Purchase History:\n"
     )
     for p in profile["recent_purchases"]:
-        context_str += f"  * Order {p['order_number']}: {', '.join(p['items'])} (Status: {p['status']}, Date: {p['date']}, Amount: Rs. {p['total_amount']:,})\n"
+        context_str += f"  * Order {p['order_number']}: {', '.join(p['items'])} ({p['status']})\n"
     context_str += "\n"
 
-    if intent in ["PRODUCT_SEARCH", "PRODUCT_RECOMMENDATION"] and db_results:
-        # Limit to top 3 products to optimize input token counts & minimize API cost
+    if intent == "PRODUCT_REVIEW" and db_results:
+        context_str += "CUSTOMER REVIEWS:\n"
+        for r in db_results[:3] if isinstance(db_results, list) else []:
+            context_str += f"- ⭐{r.get('rating')} by {r.get('reviewer_name')}: {r.get('review_text')}\n"
+    else:
         context_str += "DATABASE PRODUCTS AVAILABLE:\n"
-        if isinstance(db_results, list):
-            for p in db_results[:3]:
-                orig = f" (Original Price: Rs. {int(p['original_price']):,})" if p.get("original_price") and p["original_price"] > p["price"] else ""
-                upsell = " [Alternative Recommendation]" if p.get("is_upsell") else ""
-                context_str += (
-                    f"- Name: {p['name']}{upsell}\n"
-                    f"  Brand: {p.get('brand') or 'N/A'}\n"
-                    f"  Category: {p.get('category') or 'N/A'}\n"
-                    f"  Price: Rs. {int(p['price']):,}{orig}\n"
-                    f"  Rating: ⭐ {p.get('rating', 0)} ({p.get('review_count', 0)} reviews)\n"
-                    f"  Stock left: {p.get('stock_quantity', 0)}\n"
-                    f"  Details: {p.get('description', '')}\n\n"
-                )
-    elif intent == "PRODUCT_REVIEW" and db_results:
-        context_str += "CUSTOMER REVIEWS FOR THE PRODUCT:\n"
-        if isinstance(db_results, list):
-            for r in db_results[:3]:
-                context_str += f"- Reviewer: {r.get('reviewer_name', 'Customer')} (Rating: ⭐{r.get('rating', 5)})\n  Review: {r.get('review_text', '')}\n"
-    elif intent == "ORDER_TRACKING" and db_results:
-        if isinstance(db_results, dict) and not db_results.get("error"):
-            context_str += (
-                f"ORDER DETAILS FOUND IN DATABASE:\n"
-                f"- Order Number: {db_results.get('order_number')}\n"
-                f"- Status: {db_results.get('status')}\n"
-                f"- Carrier: {db_results.get('carrier')}\n"
-                f"- Tracking Number: {db_results.get('tracking_number')}\n"
-                f"- Estimated Delivery: {db_results.get('estimated_delivery')}\n"
-                f"- Total Bill: Rs. {int(db_results.get('total_amount', 0)):,}\n"
-                f"- Payment Method: {db_results.get('payment_method')} ({db_results.get('payment_status')})\n"
-                f"- Items: {', '.join(db_results.get('items', []))}\n"
-            )
-        elif isinstance(db_results, dict) and db_results.get("error"):
-            context_str += f"ERROR/STATUS: {db_results.get('error')}\n"
-    elif intent == "RETURN_ITEM" and db_results:
-        if isinstance(db_results, dict) and not db_results.get("error"):
-            if db_results.get("success") is True:
-                context_str += (
-                    f"RETURN REQUEST CREATED SUCCESSFULLY:\n"
-                    f"- Return Ticket: {db_results.get('return_number')}\n"
-                    f"- Order Number: {db_results.get('order_number')}\n"
-                    f"- Refund Amount: Rs. {int(db_results.get('refund_amount', 0)):,}\n"
-                    f"- Status: Requested (Under Review)\n"
-                )
-            else:
-                context_str += (
-                    f"RETURN DETAILS IN DATABASE:\n"
-                    f"- Order Number: {db_results.get('order_number')}\n"
-                    f"- Return Ticket: {db_results.get('return_number')}\n"
-                    f"- Status: {db_results.get('status')}\n"
-                    f"- Refund Amount: Rs. {int(db_results.get('refund_amount', 0)):,}\n"
-                    f"- Reason: {db_results.get('reason')}\n"
-                )
-        elif isinstance(db_results, dict) and db_results.get("error"):
-            context_str += f"ERROR/STATUS: {db_results.get('error')}\n"
-    elif intent == "FAQ" and db_results:
-        context_str += "RELEVANT SHOP FAQ / POLICY FROM KNOWLEDGEBASE:\n"
-        if isinstance(db_results, list):
-            for f in db_results[:3]:
-                context_str += f"Q: {f['question']}\nA: {f['answer']}\n\n"
+        for p in db_results[:3] if isinstance(db_results, list) else []:
+            orig = f" (Original Price: Rs. {int(p['original_price']):,})" if p.get("original_price") and p["original_price"] > p["price"] else ""
+            upsell = " [Alternative]" if p.get("is_upsell") else ""
+            context_str += f"- {p['name']}{upsell}: Rs. {int(p['price']):,}{orig}. Rating: ⭐{p['rating']}. Stock: {p['stock_quantity']}. Info: {p['description']}\n"
 
-    # 5. CONTEXT-AWARE LLM prompt construction
+    # 3. Call LLM
     history_str = ""
     for msg in history[-6:]:
         history_str += f"{msg.get('role', 'user').capitalize()}: {msg.get('content', '')}\n"
 
-    # Define sentiment adaptive instructions
     sentiment_instructions = ""
     if sentiment == "FRUSTRATED":
         sentiment_instructions = (
-            "\n[CRITICAL PERSONA DIRECTION - USER IS FRUSTRATED/DISAPPOINTED]:\n"
-            "The customer appears frustrated or disappointed. Adjust your tone to be highly empathetic, sincere, and apologetic. "
-            "Prioritize helping them immediately. Do NOT offer any sales promotions, product recommendations, or up-selling. "
-            "Focus strictly on resolving their issues (returns, tracking, refunds) with absolute politeness."
+            "The customer is frustrated. Adjust tone to be highly empathetic and apologetic. Do NOT offer promotions or upselling."
         )
+        suggestions = ["Contact support", "Check return policy", "Track my order"]
     else:
         sentiment_instructions = (
-            "Be helpful and friendly. If appropriate and they ask for suggestions, you can refer to their LOGGED-IN CUSTOMER PROFILE "
-            "active cart or preferred categories to make personalized cross-selling remarks."
+            "Be conversational and match their language (Roman Urdu or English). You may friendly reference their profile history if they ask."
         )
 
     prompt = f"""<s>[INST] {SYSTEM_PROMPT}
@@ -901,19 +750,186 @@ Recent Conversation History:
 User Message: {message}
 
 Instructions:
-1. Act as ShopEase AI Customer Support. Provide a direct, natural response in Roman Urdu or English matching the user's language and tone.
-2. Address the user by their name (e.g. Umar bhai) as defined in the LOGGED-IN CUSTOMER PROFILE name.
-3. Be conversational, warm, and professional. Avoid repeating "As-salamu alaykum" if you already greeted them in the history.
-4. Stick strictly to the facts in the DATABASE / RAG CONTEXT. Do not invent any pricing, order numbers, returns status, or coupon codes.
-5. Keep your response concise, direct, and under 50 words to be efficient. {sentiment_instructions} [/INST]"""
+- Provide a direct, natural response under 50 words in Roman Urdu/English comparison/recommending products.
+- Address them by name '{profile['full_name']}' if appropriate.
+- Stick strictly to prices and specs in database. Never make up discount codes.
+- {sentiment_instructions} [/INST]"""
 
-    # 6. Call LLM for dynamic synthesis
-    llm_resp = await call_llm(prompt)
-    if llm_resp and len(llm_resp.strip()) > 5:
-        return {"response": llm_resp, "suggestions": suggestions}
+    response = await call_llm(prompt)
+    if not response:
+        response = build_deterministic_reply(intent, message, db_results) or GREETING_REPLY
 
-    # 7. Fallback safety
     return {
-        "response": deterministic or GREETING_REPLY,
+        "response": response,
         "suggestions": suggestions,
+        "db_results": db_results,
+        "intent": intent
+    }
+
+
+async def order_agent_node(state: AgentState, db: AsyncSession) -> Dict[str, Any]:
+    """
+    Orders worker. Handles tracking, checking returns, and return requests.
+    """
+    message = state["message"]
+    history = state.get("history", [])
+
+    # 1. Fetch DB Results
+    order_ref = _resolve_order_ref(message, history)
+    lower_msg = message.lower()
+    intent = "ORDER_TRACKING"
+
+    # Check if return creation or return status check
+    initiation_kws = ["return", "wapas", "refund", "exchange", "wapsi", "initiate return"]
+    is_return = any(k in lower_msg for k in initiation_kws) or (order_ref and "ret-" in order_ref.lower())
+
+    if is_return:
+        intent = "RETURN_ITEM"
+        wants_initiation = any(k in lower_msg for k in ["want to return", "return karna", "wapas karna", "initiate"])
+        if not order_ref:
+            db_results = {
+                "error": "Kindly apna order number share karein (e.g. SE-4392) taake return process ho sake. Shukriya!"
+            }
+        elif wants_initiation:
+            db_results = await db_initiate_return(db, order_ref, "Customer requested return")
+        else:
+            db_results = await db_check_return_status(db, order_ref) or {
+                "error": f"Order {order_ref} ke liye return record nahi mila."
+            }
+    else:
+        # Order tracking
+        if not order_ref:
+            db_results = {
+                "error": "Kindly apna correct order number share karein (e.g. SE-4392) taake track kiya ja sake. Shukriya!"
+            }
+        else:
+            db_results = await db_track_order(db, order_ref) or {
+                "error": f"Order {order_ref} system me nahi mila. Check/re-enter correct ID."
+            }
+
+    # 2. Build RAG context & user profile
+    user_name = _extract_user_name(history, message)
+    profile = get_mock_user_profile(user_name)
+    sentiment = _detect_sentiment(message, history)
+    suggestions = _get_suggestions(intent, db_results)
+
+    context_str = (
+        f"LOGGED-IN CUSTOMER PROFILE:\n"
+        f"- Name: {profile['full_name']}\n"
+        f"- Active Cart: {', '.join(profile['active_cart'])}\n"
+    )
+    if isinstance(db_results, dict) and db_results.get("error"):
+        context_str += f"ERROR/STATUS: {db_results.get('error')}\n"
+    else:
+        context_str += f"DATABASE ORDER/RETURN DATA:\n{db_results}\n"
+
+    # 3. Call LLM
+    history_str = ""
+    for msg in history[-6:]:
+        history_str += f"{msg.get('role', 'user').capitalize()}: {msg.get('content', '')}\n"
+
+    sentiment_instructions = ""
+    if sentiment == "FRUSTRATED":
+        sentiment_instructions = (
+            "The customer is frustrated. Adjust tone to be highly empathetic and apologetic. Do NOT offer promotions. Focus strictly on order status/return."
+        )
+        suggestions = ["Contact support", "Check return policy", "Track my order"]
+    else:
+        sentiment_instructions = (
+            "Be direct, polite, and match their language (Roman Urdu or English). Assist them with the order/return status facts."
+        )
+
+    prompt = f"""<s>[INST] {SYSTEM_PROMPT}
+
+[DATABASE / RAG CONTEXT]:
+{context_str}
+
+Recent Conversation History:
+{history_str}
+User Message: {message}
+
+Instructions:
+- Write a direct, natural response under 50 words in Roman Urdu/English helper with order/return status.
+- Address them by name '{profile['full_name']}' if appropriate.
+- Stick strictly to tracking numbers and facts in context. Never hallucinate refund amounts.
+- {sentiment_instructions} [/INST]"""
+
+    response = await call_llm(prompt)
+    if not response:
+        response = build_deterministic_reply(intent, message, db_results) or GREETING_REPLY
+
+    return {
+        "response": response,
+        "suggestions": suggestions,
+        "db_results": db_results,
+        "intent": intent
+    }
+
+
+async def faq_agent_node(state: AgentState, db: AsyncSession) -> Dict[str, Any]:
+    """
+    Policy worker. Answers FAQ policies regarding shipping, payment, contact, etc.
+    """
+    message = state["message"]
+    history = state.get("history", [])
+
+    # 1. Fetch DB Results
+    lower_msg = message.lower()
+    focus_terms = ["return", "refund", "shipping", "delivery", "payment", "cod", "easypaisa", "jazzcash", "warranty"]
+    focus = next((t for t in focus_terms if t in lower_msg), None)
+    keywords = focus or _extract_search_keywords(message) or message
+    db_results = await db_get_faq(db, keywords)
+    if not db_results:
+        db_results = await db_get_faq(db, "")
+
+    # 2. Build RAG context & user profile
+    user_name = _extract_user_name(history, message)
+    profile = get_mock_user_profile(user_name)
+    sentiment = _detect_sentiment(message, history)
+    suggestions = _get_suggestions("FAQ", db_results)
+
+    context_str = "RELEVANT FAQ POLICY:\n"
+    for f in db_results[:2] if isinstance(db_results, list) else []:
+        context_str += f"Q: {f['question']}\nA: {f['answer']}\n\n"
+
+    # 3. Call LLM
+    history_str = ""
+    for msg in history[-6:]:
+        history_str += f"{msg.get('role', 'user').capitalize()}: {msg.get('content', '')}\n"
+
+    sentiment_instructions = ""
+    if sentiment == "FRUSTRATED":
+        sentiment_instructions = (
+            "The customer is frustrated. Adjust tone to be highly empathetic and apologetic. Answer their query clearly and directly."
+        )
+        suggestions = ["Contact support", "Check return policy", "Track my order"]
+    else:
+        sentiment_instructions = (
+            "Be helpful and match their language (Roman Urdu or English) explaining the shop policies."
+        )
+
+    prompt = f"""<s>[INST] {SYSTEM_PROMPT}
+
+[DATABASE / RAG CONTEXT]:
+{context_str}
+
+Recent Conversation History:
+{history_str}
+User Message: {message}
+
+Instructions:
+- Write a direct, natural response under 50 words in Roman Urdu/English explaining the shop policy facts.
+- Address them by name '{profile['full_name']}' if appropriate.
+- Stick strictly to policy facts in context. Never make up discount rules.
+- {sentiment_instructions} [/INST]"""
+
+    response = await call_llm(prompt)
+    if not response:
+        response = build_deterministic_reply("FAQ", message, db_results) or GREETING_REPLY
+
+    return {
+        "response": response,
+        "suggestions": suggestions,
+        "db_results": db_results,
+        "intent": "FAQ"
     }

@@ -1,5 +1,5 @@
 """
-app/ai/graph.py — ShopEase LangGraph workflow with early exit for off-topic.
+app/ai/graph.py — ShopEase LangGraph Supervisor (Captain) and worker team workflow.
 """
 from typing import Any, Dict, Literal
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -7,45 +7,66 @@ from langgraph.graph import StateGraph, START, END
 
 from app.ai.nodes import (
     AgentState,
-    detect_intent_node,
-    query_db_node,
-    generate_response_node,
+    supervisor_node,
+    product_agent_node,
+    order_agent_node,
+    faq_agent_node,
 )
 
 
 def compile_agent_graph(db: AsyncSession):
     """
-    Flow:
-      START → detect_intent
-            → (OFF_TOPIC / HUMAN / GENERAL) skip DB → generate_response → END
-            → (shop intents) query_db → generate_response → END
+    Supervisor / Captain Architecture:
+      START → supervisor (Captain decides routing)
+            → PRODUCT_AGENT (worker) → END
+            → ORDER_AGENT (worker) → END
+            → FAQ_AGENT (worker) → END
+            → FINISH (Supervisor directly responded) → END
     """
     builder = StateGraph(AgentState)
 
-    builder.add_node("detect_intent", detect_intent_node)
+    # 1. Add supervisor node
+    builder.add_node("supervisor", supervisor_node)
 
-    async def query_db_wrapper(state: AgentState) -> Dict[str, Any]:
-        return await query_db_node(state, db)
+    # 2. Add worker wrappers to bind db session
+    async def product_agent_wrapper(state: AgentState) -> Dict[str, Any]:
+        return await product_agent_node(state, db)
 
-    builder.add_node("query_db", query_db_wrapper)
-    builder.add_node("generate_response", generate_response_node)
+    async def order_agent_wrapper(state: AgentState) -> Dict[str, Any]:
+        return await order_agent_node(state, db)
 
-    def route_after_intent(state: AgentState) -> Literal["query_db", "generate_response"]:
-        intent = state.get("intent", "GENERAL_CHAT")
-        if intent in ["OFF_TOPIC", "HUMAN_SUPPORT", "GENERAL_CHAT"]:
-            return "generate_response"
-        return "query_db"
+    async def faq_agent_wrapper(state: AgentState) -> Dict[str, Any]:
+        return await faq_agent_node(state, db)
 
-    builder.add_edge(START, "detect_intent")
+    builder.add_node("product_agent", product_agent_wrapper)
+    builder.add_node("order_agent", order_agent_wrapper)
+    builder.add_node("faq_agent", faq_agent_wrapper)
+
+    # 3. Routing edge logic from Supervisor
+    def route_from_supervisor(state: AgentState) -> Literal["product_agent", "order_agent", "faq_agent", "__end__"]:
+        next_agent = state.get("next_agent", "FINISH")
+        if next_agent == "PRODUCT_AGENT":
+            return "product_agent"
+        if next_agent == "ORDER_AGENT":
+            return "order_agent"
+        if next_agent == "FAQ_AGENT":
+            return "faq_agent"
+        return "__end__"
+
+    # 4. Bind edges
+    builder.add_edge(START, "supervisor")
     builder.add_conditional_edges(
-        "detect_intent",
-        route_after_intent,
+        "supervisor",
+        route_from_supervisor,
         {
-            "query_db": "query_db",
-            "generate_response": "generate_response",
+            "product_agent": "product_agent",
+            "order_agent": "order_agent",
+            "faq_agent": "faq_agent",
+            "__end__": END,
         },
     )
-    builder.add_edge("query_db", "generate_response")
-    builder.add_edge("generate_response", END)
+    builder.add_edge("product_agent", END)
+    builder.add_edge("order_agent", END)
+    builder.add_edge("faq_agent", END)
 
     return builder.compile()
