@@ -229,37 +229,7 @@ async def db_search_products(db: AsyncSession, query: str) -> List[Dict[str, Any
     return ranked[:5]
 
 
-async def _get_hf_embedding(text: str) -> Optional[List[float]]:
-    """
-    Fetch a sentence embedding from HuggingFace Inference API.
-    Uses all-MiniLM-L6-v2 (384-dim, fast, free-tier friendly).
-    Returns None on any failure so the caller can gracefully fall back.
-    """
-    if not settings.HUGGINGFACE_API_KEY:
-        return None
-    url = "https://api-inference.huggingface.co/models/sentence-transformers/all-MiniLM-L6-v2"
-    headers = {"Authorization": f"Bearer {settings.HUGGINGFACE_API_KEY}"}
-    try:
-        async with httpx.AsyncClient(timeout=6.0) as client:
-            resp = await client.post(url, json={"inputs": text[:512]}, headers=headers)
-            if resp.status_code == 200:
-                data = resp.json()
-                # API returns a list of floats for a single string input
-                if isinstance(data, list) and data and isinstance(data[0], float):
-                    return data
-                # Some versions return nested list [[...]]
-                if isinstance(data, list) and data and isinstance(data[0], list):
-                    return data[0]
-    except Exception as e:
-        logger.debug("hf_embedding.error", error=str(e))
-    return None
 
-
-def _cosine(a: List[float], b: List[float]) -> float:
-    dot = sum(x * y for x, y in zip(a, b))
-    na = math.sqrt(sum(x * x for x in a))
-    nb = math.sqrt(sum(x * x for x in b))
-    return dot / (na * nb) if (na > 0 and nb > 0) else 0.0
 
 
 async def db_track_order(db: AsyncSession, query_str: str) -> Optional[Dict[str, Any]]:
